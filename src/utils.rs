@@ -59,3 +59,29 @@ pub fn pkt_line_encode(data: &[u8]) -> bytes::Bytes {
     bytes::Bytes::from(buf)
 }
 
+pub fn update_head_if_invalid(repo_path: &std::path::Path) {
+    let Ok(repo) = git2::Repository::open(repo_path) else { return; };
+
+    // If HEAD points to a valid ref (already has a commit), no action is needed
+    if repo.head().is_ok() {
+        return;
+    }
+
+    // Find the list of all local branches (refs/heads/*) that were just pushed
+    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+        for item in branches.flatten() {
+            if let (Some(name), _) = item {
+                if let Some(branch_name) = name {
+                    let target_ref = format!("refs/heads/{}", branch_name);
+                    // Point HEAD to this branch
+                    let _ = repo.set_head(&target_ref);
+                    
+                    // Prioritize selecting 'main' or 'master' if found
+                    if branch_name == "main" || branch_name == "master" {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}

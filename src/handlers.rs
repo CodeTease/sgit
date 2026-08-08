@@ -9,7 +9,7 @@ use tokio::process::Command;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::types::GitResponseStream;
-use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt_line_encode};
+use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt_line_encode, update_head_if_invalid};
 
 // REST API: GET / (health check)
 pub async fn handle_health_check() -> impl IntoResponse {
@@ -43,6 +43,7 @@ pub async fn handle_info_refs(
         };
         return (status, err_msg).into_response();
     }
+    update_head_if_invalid(&repo_path);
 
     let mut cmd = Command::new(service);
     cmd.arg("--stateless-rpc")
@@ -189,6 +190,8 @@ pub async fn execute_git_service_stream(
         child,
         timeout,
         cancellation_token,
+        // Only update HEAD if the service is git-receive-pack (Push)
+        repo_path: if is_push { Some(repo_path.clone()) } else { None },
     };
     let response_body = Body::from_stream(response_stream);
 
