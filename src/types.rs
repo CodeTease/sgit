@@ -6,6 +6,14 @@ use bytes::Bytes;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use crate::utils::update_head_if_invalid;
+use std::sync::Arc;
+use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+pub struct AppState {
+    pub users: Arc<HashMap<String, String>>,
+    pub has_users_file: bool,
+}
 
 // Custom response stream that holds the process child to kill on drop (disconnect) or timeout
 pub struct GitResponseStream {

@@ -11,11 +11,14 @@ use handlers::*;
 use utils::git_auth_middleware;
 
 pub fn app() -> Router {
+    let state = utils::load_users_config();
+
     // Standard and catch-all routes to support arbitrarily nested subfolders.
     // Ensure all git protocol endpoints go through the git_auth_middleware layer.
     let git_routes = Router::new()
         .route("/*path", any(handle_git_request))
-        .layer(middleware::from_fn(git_auth_middleware));
+        .layer(middleware::from_fn_with_state(state.clone(), git_auth_middleware))
+        .with_state(state);
 
     Router::new()
         .route("/", get(handle_health_check))
@@ -191,22 +194,35 @@ mod tests {
             std::env::set_var("SGIT_USERS_FILE", temp_users_file);
         }
         
-        // Write mock credentials
+        // Write mock credentials using SHA-256 hashes
         let config_toml = r#"
             [users]
-            alice = "supersecret"
-            bob = "pass123"
+            alice = "f75778f7425be4db0369d09af37a6c2b9a83dea0e53e7bd57412e4b060e607f7" # supersecret
+            bob = "90c1db884b25916cb034e32321487f84b6732cfd1e2e13fa096df0709b1192e2" # pass123
         "#;
         fs::write(temp_users_file, config_toml).unwrap();
 
         let app = app();
 
-        // 1. Without credentials -> 401 Unauthorized
+        // 1. Upload-pack (read) without credentials -> 404 NOT_FOUND (because repo does not exist, but auth is bypassed!)
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/myrepo/info/refs?service=git-upload-pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // 2. Receive-pack (write) without credentials -> 401 Unauthorized
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/myrepo/info/refs?service=git-receive-pack")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -218,13 +234,13 @@ mod tests {
             "Basic realm=\"SGit\""
         );
 
-        // 2. Incorrect credentials -> 401 Unauthorized
+        // 3. Receive-pack (write) with incorrect credentials -> 401 Unauthorized
         let bad_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:badpass"));
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/myrepo/info/refs?service=git-upload-pack")
+                    .uri("/myrepo/info/refs?service=git-receive-pack")
                     .header("Authorization", bad_auth)
                     .body(Body::empty())
                     .unwrap(),
@@ -233,7 +249,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // 3. Correct credentials -> 200 OK (will trigger auto-init on receive-pack or mock folder)
+        // 4. Receive-pack (write) with correct credentials -> 200 OK (will trigger auto-init on receive-pack or mock folder)
         let good_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:supersecret"));
         let repo_name = "auth_test_repo_123";
         let safe_path = get_safe_repo_path(repo_name).unwrap();
@@ -246,13 +262,41 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/{}/info/refs?service=git-receive-pack", repo_name))
-                    .header("Authorization", good_auth)
+                    .header("Authorization", good_auth.clone())
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        // 5. POST Upload-pack (read) without credentials -> 404 NOT_FOUND (auth is bypassed!)
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/myrepo/git-upload-pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // 6. POST Receive-pack (write) without credentials -> 401 Unauthorized
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/myrepo/git-receive-pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // Clean up
         let _ = std::fs::remove_dir_all(&safe_path);

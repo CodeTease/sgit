@@ -7,7 +7,10 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode, header, HeaderValue},
     middleware::Next,
+    extract::State,
 };
+use sha2::{Sha256, Digest};
+use crate::types::AppState;
 
 // Security Helper: Validate and map allowed git services
 pub fn validate_service(service: &str) -> Option<&'static str> {
@@ -108,19 +111,32 @@ pub struct UsersConfig {
     pub users: HashMap<String, String>,
 }
 
-pub fn validate_credentials(user: &str, pass: &str) -> bool {
+pub fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub fn load_users_config() -> AppState {
     let users_file = std::env::var("SGIT_USERS_FILE").unwrap_or_else(|_| "users.toml".to_string());
-    if let Ok(content) = fs::read_to_string(&users_file) {
-        if let Ok(config) = toml::from_str::<UsersConfig>(&content) {
-            if let Some(expected_pass) = config.users.get(user) {
-                return expected_pass == pass;
+    let mut users = HashMap::new();
+    let mut has_users_file = false;
+    if std::path::Path::new(&users_file).exists() {
+        has_users_file = true;
+        if let Ok(content) = fs::read_to_string(&users_file) {
+            if let Ok(config) = toml::from_str::<UsersConfig>(&content) {
+                users = config.users;
             }
         }
     }
-    false
+    AppState {
+        users: std::sync::Arc::new(users),
+        has_users_file,
+    }
 }
 
-pub fn check_basic_auth(auth_header: &str) -> bool {
+pub fn check_basic_auth(state: &AppState, auth_header: &str) -> bool {
     if !auth_header.starts_with("Basic ") {
         return false;
     }
@@ -138,18 +154,33 @@ pub fn check_basic_auth(auth_header: &str) -> bool {
     let Some(pass) = parts.next() else {
         return false;
     };
-    validate_credentials(user, pass)
+    
+    let hashed_pass = hash_password(pass);
+    if let Some(expected_hash) = state.users.get(user) {
+        return expected_hash == &hashed_pass;
+    }
+    false
 }
 
 pub async fn git_auth_middleware(
+    State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    let users_file = std::env::var("SGIT_USERS_FILE").unwrap_or_else(|_| "users.toml".to_string());
-    if std::path::Path::new(&users_file).exists() {
+    if state.has_users_file {
+        let path = request.uri().path();
+        let query = request.uri().query().unwrap_or("");
+        let is_write = path.ends_with("/git-receive-pack")
+            || (path.ends_with("/info/refs") && query.contains("service=git-receive-pack"));
+
+        if !is_write {
+            // Allow public clone / read
+            return next.run(request).await;
+        }
+
         if let Some(auth_header) = request.headers().get(header::AUTHORIZATION) {
             if let Ok(auth_str) = auth_header.to_str() {
-                if check_basic_auth(auth_str) {
+                if check_basic_auth(&state, auth_str) {
                     return next.run(request).await;
                 }
             }
