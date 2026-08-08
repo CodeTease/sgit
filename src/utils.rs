@@ -40,37 +40,22 @@ pub fn ensure_repo_exists(repo_path: &std::path::Path, is_push: bool) -> Result<
     Ok(())
 }
 
-// Helper to resolve tree at path
-pub fn get_tree_at_path<'a>(
-    git_repo: &'a git2::Repository,
-    reference_or_commit: Option<&str>,
-    path_str: &str,
-) -> Result<git2::Tree<'a>, String> {
-    let commit = if let Some(ref_name) = reference_or_commit {
-        let obj = git_repo.revparse_single(ref_name)
-            .map_err(|e| format!("Could not find reference '{}': {}", ref_name, e))?;
-        obj.peel_to_commit()
-            .map_err(|e| format!("Reference '{}' does not resolve to a commit: {}", ref_name, e))?
-    } else {
-        let head_ref = git_repo.head()
-            .map_err(|e| format!("Could not get HEAD reference: {}", e))?;
-        head_ref.peel_to_commit()
-            .map_err(|e| format!("HEAD does not resolve to a commit: {}", e))?
-    };
-
-    let root_tree = commit.tree()
-        .map_err(|e| format!("Could not get commit tree: {}", e))?;
-
-    if path_str.is_empty() {
-        Ok(root_tree)
-    } else {
-        let entry = root_tree.get_path(std::path::Path::new(path_str))
-            .map_err(|e| format!("Path '{}' not found: {}", path_str, e))?;
-        let obj = entry.to_object(git_repo)
-            .map_err(|e| format!("Could not convert tree entry to object: {}", e))?;
-        let tree = obj.as_tree()
-            .ok_or_else(|| format!("Path '{}' is not a directory/tree", path_str))?;
-        Ok(tree.clone())
+/// Encodes a data payload into Git's pkt-line format.
+/// The specification defines a pkt-line as 4 hex characters representing the line length (including the 4 length bytes),
+/// followed by the data payload. The maximum line length is 65524 bytes.
+pub fn pkt_line_encode(data: &[u8]) -> bytes::Bytes {
+    let len = data.len();
+    if len == 0 {
+        return bytes::Bytes::from_static(b"0000");
     }
+    // pkt-line maximum length is 65524 (since 65520 + 4 = 65524, and length is represented by 4 hex chars, max FFFF is 65535, but Git spec limits payload size to 65520).
+    // Let's cap and split, or chunk, but usually we just encode single packet line.
+    assert!(len <= 65520, "pkt-line payload too large: max is 65520 bytes");
+    let total_len = len + 4;
+    let mut buf = Vec::with_capacity(total_len);
+    let hex = format!("{:04x}", total_len);
+    buf.extend_from_slice(hex.as_bytes());
+    buf.extend_from_slice(data);
+    bytes::Bytes::from(buf)
 }
 
