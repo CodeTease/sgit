@@ -39,11 +39,37 @@ impl Stream for GitResponseStream {
 impl Drop for GitResponseStream {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
-        let _ = self.child.start_kill();
-    
+        
+        // Wait (or kill if we disconnect prematurely), but try to check child's success status
+        // Drop is synchronous, so we can only invoke try_wait or start_kill.
+        // We'll see if the child has already exited, and if it exited with success, trigger GC
+        let exited_successfully = match self.child.try_wait() {
+            Ok(Some(status)) => status.success(),
+            _ => {
+                let _ = self.child.start_kill();
+                false
+            }
+        };
+
         // Automatically check and update HEAD after the git stream process completes
         if let Some(path) = &self.repo_path {
             update_head_if_invalid(path);
+            
+            if exited_successfully {
+                // Spawn an async background task to run git gc --auto
+                let path_clone = path.clone();
+                tokio::spawn(async move {
+                    let mut gc_cmd = tokio::process::Command::new("git");
+                    gc_cmd.arg("-C")
+                          .arg(&path_clone)
+                          .arg("gc")
+                          .arg("--auto")
+                          .stdin(std::process::Stdio::null())
+                          .stdout(std::process::Stdio::null())
+                          .stderr(std::process::Stdio::null());
+                    let _ = gc_cmd.status().await;
+                });
+            }
         }
     }
 }

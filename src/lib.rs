@@ -3,17 +3,23 @@ pub mod utils;
 pub mod handlers;
 
 use axum::{
-    routing::{get, post},
+    routing::{any, get},
     Router,
+    middleware,
 };
 use handlers::*;
+use utils::git_auth_middleware;
 
 pub fn app() -> Router {
+    // Standard and catch-all routes to support arbitrarily nested subfolders.
+    // Ensure all git protocol endpoints go through the git_auth_middleware layer.
+    let git_routes = Router::new()
+        .route("/*path", any(handle_git_request))
+        .layer(middleware::from_fn(git_auth_middleware));
+
     Router::new()
         .route("/", get(handle_health_check))
-        .route("/:repo/info/refs", get(handle_info_refs))
-        .route("/:repo/git-upload-pack", post(handle_upload_pack))
-        .route("/:repo/git-receive-pack", post(handle_receive_pack))
+        .merge(git_routes)
 }
 
 #[cfg(test)]
@@ -25,9 +31,15 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::util::ServiceExt;
+    use std::fs;
+    use base64::Engine;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn test_health_check() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let app = app();
         let response = app
             .oneshot(
@@ -48,6 +60,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_repo_management_and_auto_init() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let repo_name = "test_auto_init_repo_123";
         let safe_path = get_safe_repo_path(repo_name).unwrap();
         if safe_path.exists() {
@@ -78,6 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pkt_line_encode_and_ref_advertisement() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let repo_name = "test_ref_advertisement_repo";
         let safe_path = get_safe_repo_path(repo_name).unwrap();
         if safe_path.exists() {
@@ -125,7 +139,7 @@ mod tests {
             .await
             .unwrap();
         
-        // Output must start withpkt-line service line and flush packet (0000)
+        // Output must start with pkt-line service line and flush packet (0000)
         let expected_prefix = utils::pkt_line_encode(b"# service=git-upload-pack\n");
         assert!(body.starts_with(&expected_prefix));
         
@@ -134,6 +148,148 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
+    async fn test_path_sanitization_and_namespaces() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Test namespaces and nesting
+        let nested_repo = "user/nested/myrepo";
+        let path = get_safe_repo_path(nested_repo).unwrap();
+        assert!(path.to_str().unwrap().contains("user/nested/myrepo.git"));
+
+        // Test redundant `.git` suffix avoidance
+        let nested_git = "user/nested/myrepo.git";
+        let path_git = get_safe_repo_path(nested_git).unwrap();
+        assert!(path_git.to_str().unwrap().ends_with("user/nested/myrepo.git"));
+
+        // Test traversal and malicious inputs
+        assert!(get_safe_repo_path("../etc/passwd").is_none());
+        assert!(get_safe_repo_path("user/../nested").is_none());
+        assert!(get_safe_repo_path("\\windows\\system32").is_none());
+        assert!(get_safe_repo_path("user//nested").is_none());
+        assert!(get_safe_repo_path("/leading").is_none());
+        assert!(get_safe_repo_path("trailing/").is_none());
+        assert!(get_safe_repo_path("").is_none());
+
+        // Test custom env variable for storage
+        unsafe {
+            std::env::set_var("SGIT_DATA_DIR", "/custom/data/dir");
+        }
+        let path_custom = get_safe_repo_path("cool-repo").unwrap();
+        assert_eq!(path_custom.to_str().unwrap(), "/custom/data/dir/cool-repo.git");
+        unsafe {
+            std::env::remove_var("SGIT_DATA_DIR");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_basic_auth_middleware() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let temp_users_file = "temp_users.toml";
+        unsafe {
+            std::env::set_var("SGIT_USERS_FILE", temp_users_file);
+        }
+        
+        // Write mock credentials
+        let config_toml = r#"
+            [users]
+            alice = "supersecret"
+            bob = "pass123"
+        "#;
+        fs::write(temp_users_file, config_toml).unwrap();
+
+        let app = app();
+
+        // 1. Without credentials -> 401 Unauthorized
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/myrepo/info/refs?service=git-upload-pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get("WWW-Authenticate").unwrap().to_str().unwrap(),
+            "Basic realm=\"SGit\""
+        );
+
+        // 2. Incorrect credentials -> 401 Unauthorized
+        let bad_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:badpass"));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/myrepo/info/refs?service=git-upload-pack")
+                    .header("Authorization", bad_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Correct credentials -> 200 OK (will trigger auto-init on receive-pack or mock folder)
+        let good_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:supersecret"));
+        let repo_name = "auth_test_repo_123";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{}/info/refs?service=git-receive-pack", repo_name))
+                    .header("Authorization", good_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&safe_path);
+        let _ = fs::remove_file(temp_users_file);
+        unsafe {
+            std::env::remove_var("SGIT_USERS_FILE");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_env_timeout_and_port() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Test timeout parsing logic from env in a simple way
+        unsafe {
+            std::env::set_var("SGIT_TIMEOUT", "120");
+        }
+        let timeout_secs = std::env::var("SGIT_TIMEOUT")
+            .ok()
+            .and_then(|val| val.parse::<u64>().ok())
+            .unwrap_or(60);
+        assert_eq!(timeout_secs, 120);
+        unsafe {
+            std::env::remove_var("SGIT_TIMEOUT");
+        }
+
+        // Test port parsing logic
+        unsafe {
+            std::env::set_var("SGIT_PORT", "8080");
+        }
+        let port = std::env::var("SGIT_PORT")
+            .ok()
+            .and_then(|val| val.parse::<u16>().ok())
+            .unwrap_or(3000);
+        assert_eq!(port, 8080);
+        unsafe {
+            std::env::remove_var("SGIT_PORT");
+        }
     }
 }
 

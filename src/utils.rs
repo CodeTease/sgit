@@ -1,4 +1,13 @@
 use std::path::PathBuf;
+use std::collections::HashMap;
+use std::fs;
+use serde::Deserialize;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use axum::{
+    body::Body,
+    http::{Request, Response, StatusCode, header, HeaderValue},
+    middleware::Next,
+};
 
 // Security Helper: Validate and map allowed git services
 pub fn validate_service(service: &str) -> Option<&'static str> {
@@ -13,12 +22,30 @@ pub fn validate_service(service: &str) -> Option<&'static str> {
 pub fn get_safe_repo_path(repo_name: &str) -> Option<PathBuf> {
     if repo_name.is_empty()
         || repo_name.contains("..")
-        || repo_name.contains('/')
         || repo_name.contains('\\')
+        || repo_name.contains("//")
+        || repo_name.starts_with('/')
+        || repo_name.ends_with('/')
     {
         return None;
     }
-    Some(PathBuf::from("/tmp/git-repos").join(format!("{}.git", repo_name)))
+
+    let base_dir = std::env::var("SGIT_DATA_DIR").unwrap_or_else(|_| {
+        if cfg!(test) {
+            "/tmp/git-repos".to_string()
+        } else {
+            "/var/lib/sgit".to_string()
+        }
+    });
+    let base_path = PathBuf::from(base_dir);
+
+    let normalized = if repo_name.ends_with(".git") {
+        repo_name.to_string()
+    } else {
+        format!("{}.git", repo_name)
+    };
+
+    Some(base_path.join(normalized))
 }
 
 // Auto-initialize helper
@@ -41,15 +68,11 @@ pub fn ensure_repo_exists(repo_path: &std::path::Path, is_push: bool) -> Result<
 }
 
 /// Encodes a data payload into Git's pkt-line format.
-/// The specification defines a pkt-line as 4 hex characters representing the line length (including the 4 length bytes),
-/// followed by the data payload. The maximum line length is 65524 bytes.
 pub fn pkt_line_encode(data: &[u8]) -> bytes::Bytes {
     let len = data.len();
     if len == 0 {
         return bytes::Bytes::from_static(b"0000");
     }
-    // pkt-line maximum length is 65524 (since 65520 + 4 = 65524, and length is represented by 4 hex chars, max FFFF is 65535, but Git spec limits payload size to 65520).
-    // Let's cap and split, or chunk, but usually we just encode single packet line.
     assert!(len <= 65520, "pkt-line payload too large: max is 65520 bytes");
     let total_len = len + 4;
     let mut buf = Vec::with_capacity(total_len);
@@ -62,20 +85,16 @@ pub fn pkt_line_encode(data: &[u8]) -> bytes::Bytes {
 pub fn update_head_if_invalid(repo_path: &std::path::Path) {
     let Ok(repo) = git2::Repository::open(repo_path) else { return; };
 
-    // If HEAD points to a valid ref (already has a commit), no action is needed
     if repo.head().is_ok() {
         return;
     }
 
-    // Find the list of all local branches (refs/heads/*) that were just pushed
     if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
         for (branch, _) in branches.flatten() {
             if let Ok(Some(branch_name)) = branch.name() {
                 let target_ref = format!("refs/heads/{}", branch_name);
-                // Point HEAD to this branch
                 let _ = repo.set_head(&target_ref);
                 
-                // Prioritize selecting 'main' or 'master' if found
                 if branch_name == "main" || branch_name == "master" {
                     break;
                 }
@@ -83,3 +102,70 @@ pub fn update_head_if_invalid(repo_path: &std::path::Path) {
         }
     }
 }
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct UsersConfig {
+    pub users: HashMap<String, String>,
+}
+
+pub fn validate_credentials(user: &str, pass: &str) -> bool {
+    let users_file = std::env::var("SGIT_USERS_FILE").unwrap_or_else(|_| "users.toml".to_string());
+    if let Ok(content) = fs::read_to_string(&users_file) {
+        if let Ok(config) = toml::from_str::<UsersConfig>(&content) {
+            if let Some(expected_pass) = config.users.get(user) {
+                return expected_pass == pass;
+            }
+        }
+    }
+    false
+}
+
+pub fn check_basic_auth(auth_header: &str) -> bool {
+    if !auth_header.starts_with("Basic ") {
+        return false;
+    }
+    let encoded = &auth_header[6..];
+    let Ok(decoded_bytes) = STANDARD.decode(encoded.trim()) else {
+        return false;
+    };
+    let Ok(decoded_str) = String::from_utf8(decoded_bytes) else {
+        return false;
+    };
+    let mut parts = decoded_str.splitn(2, ':');
+    let Some(user) = parts.next() else {
+        return false;
+    };
+    let Some(pass) = parts.next() else {
+        return false;
+    };
+    validate_credentials(user, pass)
+}
+
+pub async fn git_auth_middleware(
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let users_file = std::env::var("SGIT_USERS_FILE").unwrap_or_else(|_| "users.toml".to_string());
+    if std::path::Path::new(&users_file).exists() {
+        if let Some(auth_header) = request.headers().get(header::AUTHORIZATION) {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if check_basic_auth(auth_str) {
+                    return next.run(request).await;
+                }
+            }
+        }
+        
+        let mut response = Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("Unauthorized"))
+            .unwrap();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"SGit\""),
+        );
+        return response;
+    }
+
+    next.run(request).await
+}
+

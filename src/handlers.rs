@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode, Method},
     response::{IntoResponse, Response},
 };
 use std::{collections::HashMap, process::Stdio};
@@ -16,12 +16,34 @@ pub async fn handle_health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
-// 1. Discover refs handler
-pub async fn handle_info_refs(
-    Path(repo): Path<String>,
+// Catch-all Git handler supporting arbitrary nested namespaces/subfolders
+pub async fn handle_git_request(
+    Path(path): Path<String>,
+    method: Method,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+    body: Body,
+) -> Response {
+    if path.ends_with("/info/refs") && method == Method::GET {
+        let repo = path.trim_end_matches("/info/refs").to_string();
+        handle_info_refs_internal(repo, params, headers).await
+    } else if path.ends_with("/git-upload-pack") && method == Method::POST {
+        let repo = path.trim_end_matches("/git-upload-pack").to_string();
+        execute_git_service_stream(repo, "git-upload-pack", headers, body).await
+    } else if path.ends_with("/git-receive-pack") && method == Method::POST {
+        let repo = path.trim_end_matches("/git-receive-pack").to_string();
+        execute_git_service_stream(repo, "git-receive-pack", headers, body).await
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+// 1. Discover refs handler
+pub async fn handle_info_refs_internal(
+    repo: String,
+    params: HashMap<String, String>,
+    headers: HeaderMap,
+) -> Response {
     let Some(repo_path) = get_safe_repo_path(&repo) else {
         return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
     };
@@ -80,6 +102,15 @@ pub async fn handle_info_refs(
     );
 
     (StatusCode::OK, res_headers, body).into_response()
+}
+
+// For backward compatibility/testing of older handlers
+pub async fn handle_info_refs(
+    Path(repo): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_info_refs_internal(repo, params, headers).await
 }
 
 // 2. Upload pack handler (Fetch/Clone)
@@ -183,8 +214,13 @@ pub async fn execute_git_service_stream(
         }
     });
 
-    // Wrap stdout in GitResponseStream with timeout (60s)
-    let timeout = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60)));
+    // Wrap stdout in GitResponseStream with timeout read from environment variable SGIT_TIMEOUT (default 60s)
+    let timeout_secs = std::env::var("SGIT_TIMEOUT")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(60);
+    let timeout = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)));
+
     let response_stream = GitResponseStream {
         inner: ReaderStream::new(child_stdout),
         child,
