@@ -69,17 +69,15 @@ pub fn update_head_if_invalid(repo_path: &std::path::Path) {
 
     // Find the list of all local branches (refs/heads/*) that were just pushed
     if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
-        for item in branches.flatten() {
-            if let (Some(name), _) = item {
-                if let Some(branch_name) = name {
-                    let target_ref = format!("refs/heads/{}", branch_name);
-                    // Point HEAD to this branch
-                    let _ = repo.set_head(&target_ref);
-                    
-                    // Prioritize selecting 'main' or 'master' if found
-                    if branch_name == "main" || branch_name == "master" {
-                        break;
-                    }
+        for (branch, _) in branches.flatten() {
+            if let Ok(Some(branch_name)) = branch.name() {
+                let target_ref = format!("refs/heads/{}", branch_name);
+                // Point HEAD to this branch
+                let _ = repo.set_head(&target_ref);
+                
+                // Prioritize selecting 'main' or 'master' if found
+                if branch_name == "main" || branch_name == "master" {
+                    break;
                 }
             }
         }
