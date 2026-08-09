@@ -1,0 +1,7 @@
+# For testing purpose only
+FROM rust:trixie
+# Actually this image already installed these libraries
+#RUN apt install -y libssl-dev pkg-config gcc make perl
+WORKDIR /app
+COPY . .
+RUN cargo build --release
