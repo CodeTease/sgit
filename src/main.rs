@@ -3,13 +3,14 @@ use sgit::app;
 #[tokio::main]
 async fn main() {
     let app = app();
-
+    
+    let host = std::env::var("SGIT_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port = std::env::var("SGIT_PORT")
         .ok()
         .and_then(|val| val.parse::<u16>().ok())
         .unwrap_or(3000);
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|_| panic!("Failed to bind to {}", addr));
