@@ -36,6 +36,11 @@ SGit is highly configurable using process-wide environment variables:
 | `SGIT_DATA_DIR`      | Base directory where the Git repositories are stored | `/var/lib/sgit` |
 | `SGIT_USERS_FILE`    | Path to the TOML configuration file containing user credentials | `users.toml` |
 | `SGIT_TIMEOUT`       | Execution timeout in seconds for Git streaming operations | `60` |
+| `SGIT_MAX_REQUEST_SIZE_MB` | Maximum request body size in MB to prevent disk exhaustion from pushing massive repositories | `500` |
+| `SGIT_MAX_CONCURRENT_REQS` | Maximum number of concurrent git processes to prevent CPU/RAM usage spikes | `20` |
+| `SGIT_RATE_LIMIT_PER_IP` | Maximum number of requests per IP address per minute to mitigate spam/DoS | `30` |
+| `SGIT_READ_TIMEOUT`  | Execution timeout in seconds for small metadata read requests like `info/refs` | `15` |
+| `SGIT_STREAM_TIMEOUT` | Execution timeout in seconds for data streaming during push/pull operations (falls back to `SGIT_TIMEOUT`) | `60` |
 
 ---
 

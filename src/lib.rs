@@ -20,9 +20,44 @@ pub fn app() -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), git_auth_middleware))
         .with_state(state);
 
-    Router::new()
+    let mut app = Router::new()
         .route("/", get(handle_health_check))
-        .merge(git_routes)
+        .merge(git_routes);
+
+    // 1. Push Size Limit (Max Request Body)
+    let max_request_size_mb = std::env::var("SGIT_MAX_REQUEST_SIZE_MB")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(500);
+    let limit_bytes = max_request_size_mb * 1024 * 1024;
+    app = app.layer(axum::extract::DefaultBodyLimit::max(limit_bytes));
+
+    // 2. Concurrency Limit
+    let max_concurrent_reqs = std::env::var("SGIT_MAX_CONCURRENT_REQS")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(20);
+    app = app.layer(tower::limit::ConcurrencyLimitLayer::new(max_concurrent_reqs));
+
+    // 3. Rate Limiting
+    let rate_limit = std::env::var("SGIT_RATE_LIMIT_PER_IP")
+        .ok()
+        .and_then(|val| val.parse::<u32>().ok())
+        .unwrap_or(30);
+
+    if rate_limit > 0 {
+        let ms_per_request = 60000 / rate_limit;
+        let governor_conf = std::sync::Arc::new(
+            tower_governor::governor::GovernorConfigBuilder::default()
+                .per_millisecond(ms_per_request as u64)
+                .burst_size(rate_limit)
+                .finish()
+                .unwrap()
+        );
+        app = app.layer(tower_governor::GovernorLayer { config: governor_conf });
+    }
+
+    app
 }
 
 #[cfg(test)]
@@ -31,7 +66,7 @@ mod tests {
     use utils::get_safe_repo_path;
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+            http::StatusCode,
     };
     use tower::util::ServiceExt;
     use std::fs;
@@ -40,14 +75,22 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn mock_request(method: &str, uri: &str) -> axum::http::request::Builder {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 12345));
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(addr)
+            .extension(axum::extract::ConnectInfo(addr))
+    }
+
     #[tokio::test]
     async fn test_health_check() {
         let _guard = TEST_LOCK.lock().unwrap();
         let app = app();
         let response = app
             .oneshot(
-                Request::builder()
-                    .uri("/")
+                mock_request("GET", "/")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -76,8 +119,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("/{}/info/refs?service=git-receive-pack", repo_name))
+                mock_request("GET", &format!("/{}/info/refs?service=git-receive-pack", repo_name))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -125,8 +167,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("/{}/info/refs?service=git-upload-pack", repo_name))
+                mock_request("GET", &format!("/{}/info/refs?service=git-upload-pack", repo_name))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -208,8 +249,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri("/myrepo/info/refs?service=git-upload-pack")
+                mock_request("GET", "/myrepo/info/refs?service=git-upload-pack")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -221,8 +261,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri("/myrepo/info/refs?service=git-receive-pack")
+                mock_request("GET", "/myrepo/info/refs?service=git-receive-pack")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -239,8 +278,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri("/myrepo/info/refs?service=git-receive-pack")
+                mock_request("GET", "/myrepo/info/refs?service=git-receive-pack")
                     .header("Authorization", bad_auth)
                     .body(Body::empty())
                     .unwrap(),
@@ -260,8 +298,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri(format!("/{}/info/refs?service=git-receive-pack", repo_name))
+                mock_request("GET", &format!("/{}/info/refs?service=git-receive-pack", repo_name))
                     .header("Authorization", good_auth.clone())
                     .body(Body::empty())
                     .unwrap(),
@@ -274,9 +311,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/myrepo/git-upload-pack")
+                mock_request("POST", "/myrepo/git-upload-pack")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -288,9 +323,7 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/myrepo/git-receive-pack")
+                mock_request("POST", "/myrepo/git-receive-pack")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -334,6 +367,148 @@ mod tests {
         unsafe {
             std::env::remove_var("SGIT_PORT");
         }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("SGIT_RATE_LIMIT_PER_IP", "3");
+        }
+        let app = app();
+
+        // 3 requests should succeed
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    mock_request("GET", "/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // 4th request should be rate-limited
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request("GET", "/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        unsafe {
+            std::env::remove_var("SGIT_RATE_LIMIT_PER_IP");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_size_limit() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_request_size_limit_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        unsafe {
+            std::env::set_var("SGIT_MAX_REQUEST_SIZE_MB", "1");
+        }
+        let app = app();
+
+        // Body larger than 1MB
+        let large_bytes = vec![0u8; 1100 * 1024];
+        let len = large_bytes.len();
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
+                    .header("content-length", len.to_string())
+                    .body(Body::from(large_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        unsafe {
+            std::env::remove_var("SGIT_MAX_REQUEST_SIZE_MB");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_read_timeout_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        unsafe {
+            std::env::set_var("SGIT_READ_TIMEOUT", "0");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request("GET", &format!("/{}/info/refs?service=git-upload-pack", repo_name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        unsafe {
+            std::env::remove_var("SGIT_READ_TIMEOUT");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
+    async fn test_stream_timeout() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_stream_timeout_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        unsafe {
+            std::env::set_var("SGIT_STREAM_TIMEOUT", "0");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let result = axum::body::to_bytes(body, 1000000).await;
+        assert!(result.is_err());
+
+        unsafe {
+            std::env::remove_var("SGIT_STREAM_TIMEOUT");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
     }
 }
 

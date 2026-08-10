@@ -79,9 +79,21 @@ pub async fn handle_info_refs_internal(
         }
     }
 
-    let output = match cmd.output().await {
-        Ok(out) if out.status.success() => out,
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Git execution error").into_response(),
+    // Read timeout from environment variable SGIT_READ_TIMEOUT (default 15s)
+    let read_timeout_secs = std::env::var("SGIT_READ_TIMEOUT")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(15);
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(read_timeout_secs),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => out,
+        Ok(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Git execution error").into_response(),
+        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, "Request timed out").into_response(),
     };
 
     // Calculate pkt-line header using helper function
@@ -152,6 +164,23 @@ pub async fn execute_git_service_stream(
         return (status, err_msg).into_response();
     }
 
+    // Enforce Push Size Limit (Max Request Body)
+    let max_request_size_mb = std::env::var("SGIT_MAX_REQUEST_SIZE_MB")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(500);
+    let limit_bytes = max_request_size_mb * 1024 * 1024;
+
+    if let Some(content_length) = headers.get(header::CONTENT_LENGTH) {
+        if let Ok(cl_str) = content_length.to_str() {
+            if let Ok(cl) = cl_str.parse::<usize>() {
+                if cl > limit_bytes {
+                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                }
+            }
+        }
+    }
+
     let mut cmd = Command::new(service);
     cmd.arg("--stateless-rpc")
         .arg(&repo_path)
@@ -202,22 +231,29 @@ pub async fn execute_git_service_stream(
     // Stream Axum Body directly into process stdin in background task
     let stdin_token = cancellation_token.clone();
     tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
         let body_stream = body.into_data_stream();
-        let mut body_reader = StreamReader::new(
+        let body_reader = StreamReader::new(
             tokio_stream::StreamExt::map(body_stream, |res| {
                 res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
             })
         );
+        let mut limited_reader = body_reader.take(limit_bytes as u64);
         tokio::select! {
             _ = stdin_token.cancelled() => {},
-            _ = tokio::io::copy(&mut body_reader, &mut child_stdin) => {}
+            _ = tokio::io::copy(&mut limited_reader, &mut child_stdin) => {}
         }
     });
 
-    // Wrap stdout in GitResponseStream with timeout read from environment variable SGIT_TIMEOUT (default 60s)
-    let timeout_secs = std::env::var("SGIT_TIMEOUT")
+    // Wrap stdout in GitResponseStream with timeout read from environment variable SGIT_STREAM_TIMEOUT, falling back to SGIT_TIMEOUT (default 60s)
+    let timeout_secs = std::env::var("SGIT_STREAM_TIMEOUT")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("SGIT_TIMEOUT")
+                .ok()
+                .and_then(|val| val.parse::<u64>().ok())
+        })
         .unwrap_or(60);
     let timeout = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)));
 
