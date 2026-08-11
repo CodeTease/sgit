@@ -22,6 +22,7 @@ A **CodeTease** project.
   - **Asynchronous Garbage Collection**: Spawns non-blocking background tasks to execute `git gc --auto` upon successful pushes, keeping disk usage and packfiles optimized.
   - **Graceful Shutdown**: Listens for system interruption signals to clean up ongoing processes and close client connections safely.
   - **Request Timeouts**: Safely terminates stalled or runaway git operations using configurable request timeouts.
+  - **Dynamic Configuration Reloading**: Listens for the `SIGHUP` signal on Unix platforms to dynamically reload user credentials from the TOML configuration file in-place, without restarting the server or interrupting active Git streams.
 
 ---
 
@@ -41,6 +42,7 @@ SGit is highly configurable using process-wide environment variables:
 | `SGIT_RATE_LIMIT_PER_IP` | Maximum number of requests per IP address per minute to mitigate spam/DoS | `30` |
 | `SGIT_READ_TIMEOUT`  | Execution timeout in seconds for small metadata read requests like `info/refs` | `15` |
 | `SGIT_STREAM_TIMEOUT` | Execution timeout in seconds for data streaming during push/pull operations (falls back to `SGIT_TIMEOUT`) | `60` |
+| `SGIT_MAX_REPO_SIZE_MB` | Maximum allowed repository storage size in MB (enforces disk quota per repository) | `None` (unlimited) |
 
 ---
 
