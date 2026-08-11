@@ -9,10 +9,13 @@ use crate::utils::update_head_if_invalid;
 use std::sync::Arc;
 use std::collections::HashMap;
 
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+
 #[derive(Clone, Debug)]
 pub struct AppState {
-    pub users: Arc<HashMap<String, String>>,
-    pub has_users_file: bool,
+    pub users: Arc<RwLock<HashMap<String, String>>>,
+    pub has_users_file: Arc<AtomicBool>,
 }
 
 // Custom response stream that holds the process child to kill on drop (disconnect) or timeout

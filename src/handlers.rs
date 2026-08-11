@@ -67,6 +67,19 @@ pub async fn handle_info_refs_internal(
     }
     update_head_if_invalid(&repo_path);
 
+    if is_push {
+        if let Ok(quota_val) = std::env::var("SGIT_MAX_REPO_SIZE_MB") {
+            if let Ok(quota_mb) = quota_val.parse::<u64>() {
+                let quota_bytes = quota_mb * 1024 * 1024;
+                if let Ok(current_size) = crate::utils::get_dir_size(&repo_path) {
+                    if current_size >= quota_bytes {
+                        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded").into_response();
+                    }
+                }
+            }
+        }
+    }
+
     let mut cmd = Command::new(service);
     cmd.arg("--stateless-rpc")
         .arg("--advertise-refs")
@@ -164,6 +177,19 @@ pub async fn execute_git_service_stream(
         return (status, err_msg).into_response();
     }
 
+    if is_push {
+        if let Ok(quota_val) = std::env::var("SGIT_MAX_REPO_SIZE_MB") {
+            if let Ok(quota_mb) = quota_val.parse::<u64>() {
+                let quota_bytes = quota_mb * 1024 * 1024;
+                if let Ok(current_size) = crate::utils::get_dir_size(&repo_path) {
+                    if current_size >= quota_bytes {
+                        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded").into_response();
+                    }
+                }
+            }
+        }
+    }
+
     // Enforce Push Size Limit (Max Request Body)
     let max_request_size_mb = std::env::var("SGIT_MAX_REQUEST_SIZE_MB")
         .ok()
@@ -222,7 +248,7 @@ pub async fn execute_git_service_stream(
             _ = child_stderr.read_to_end(&mut buf) => {
                 if !buf.is_empty() {
                     let err_str = String::from_utf8_lossy(&buf);
-                    eprintln!("Git service [{}] stderr: {}", service, err_str);
+                    crate::log_stderr!("Git service [{}] stderr: {}", service, err_str);
                 }
             }
         }

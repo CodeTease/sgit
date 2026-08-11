@@ -52,6 +52,24 @@ pub fn get_safe_repo_path(repo_name: &str) -> Option<PathBuf> {
 }
 
 // Auto-initialize helper
+pub fn get_dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total_size = 0;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                total_size += get_dir_size(&path)?;
+            } else {
+                total_size += entry.metadata()?.len();
+            }
+        }
+    } else {
+        total_size += path.metadata()?.len();
+    }
+    Ok(total_size)
+}
+
 pub fn ensure_repo_exists(repo_path: &std::path::Path, is_push: bool) -> Result<(), String> {
     if !repo_path.exists() {
         if is_push {
@@ -111,12 +129,26 @@ pub struct UsersConfig {
     pub users: HashMap<String, String>,
 }
 
+#[macro_export]
+macro_rules! log_stderr {
+    ($($arg:tt)*) => {{
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        eprintln!("[{}] {}", timestamp, format_args!($($arg)*));
+    }};
+}
+
 pub fn hash_password(password: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect()
 }
+
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn load_users_config() -> AppState {
     let users_file = std::env::var("SGIT_USERS_FILE").unwrap_or_else(|_| "users.toml".to_string());
@@ -131,9 +163,27 @@ pub fn load_users_config() -> AppState {
         }
     }
     AppState {
-        users: std::sync::Arc::new(users),
-        has_users_file,
+        users: Arc::new(RwLock::new(users)),
+        has_users_file: Arc::new(AtomicBool::new(has_users_file)),
     }
+}
+
+pub fn reload_users_config(state: &AppState) {
+    let users_file = std::env::var("SGIT_USERS_FILE").unwrap_or_else(|_| "users.toml".to_string());
+    let mut users = HashMap::new();
+    let mut has_users_file = false;
+    if std::path::Path::new(&users_file).exists() {
+        has_users_file = true;
+        if let Ok(content) = fs::read_to_string(&users_file) {
+            if let Ok(config) = toml::from_str::<UsersConfig>(&content) {
+                users = config.users;
+            }
+        }
+    }
+    if let Ok(mut lock) = state.users.write() {
+        *lock = users;
+    }
+    state.has_users_file.store(has_users_file, Ordering::SeqCst);
 }
 
 pub fn check_basic_auth(state: &AppState, auth_header: &str) -> bool {
@@ -156,8 +206,10 @@ pub fn check_basic_auth(state: &AppState, auth_header: &str) -> bool {
     };
     
     let hashed_pass = hash_password(pass);
-    if let Some(expected_hash) = state.users.get(user) {
-        return expected_hash == &hashed_pass;
+    if let Ok(lock) = state.users.read() {
+        if let Some(expected_hash) = lock.get(user) {
+            return expected_hash == &hashed_pass;
+        }
     }
     false
 }
@@ -167,7 +219,7 @@ pub async fn git_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    if state.has_users_file {
+    if state.has_users_file.load(Ordering::SeqCst) {
         let path = request.uri().path();
         let query = request.uri().query().unwrap_or("");
         let is_write = path.ends_with("/git-receive-pack")

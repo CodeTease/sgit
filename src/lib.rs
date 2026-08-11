@@ -13,6 +13,20 @@ use utils::git_auth_middleware;
 pub fn app() -> Router {
     let state = utils::load_users_config();
 
+    // SIGHUP Config Reload
+    #[cfg(unix)]
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut stream) = signal(SignalKind::hangup()) {
+                while stream.recv().await.is_some() {
+                    utils::reload_users_config(&state_clone);
+                }
+            }
+        });
+    }
+
     // Standard and catch-all routes to support arbitrarily nested subfolders.
     // Ensure all git protocol endpoints go through the git_auth_middleware layer.
     let git_routes = Router::new()
@@ -507,6 +521,82 @@ mod tests {
 
         unsafe {
             std::env::remove_var("SGIT_STREAM_TIMEOUT");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
+    async fn test_sighup_config_reload() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let temp_users_file = "temp_sighup_users.toml";
+        unsafe {
+            std::env::set_var("SGIT_USERS_FILE", temp_users_file);
+        }
+
+        // Initial config with user 'alice'
+        let initial_toml = r#"
+            [users]
+            alice = "f75778f7425be4db0369d09af37a6c2b9a83dea0e53e7bd57412e4b060e607f7" # supersecret
+        "#;
+        fs::write(temp_users_file, initial_toml).unwrap();
+
+        let app_state = utils::load_users_config();
+        assert!(utils::check_basic_auth(&app_state, &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:supersecret"))));
+        assert!(!utils::check_basic_auth(&app_state, &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("bob:pass123"))));
+
+        // Overwrite file with new credentials (added 'bob')
+        let updated_toml = r#"
+            [users]
+            alice = "f75778f7425be4db0369d09af37a6c2b9a83dea0e53e7bd57412e4b060e607f7" # supersecret
+            bob = "9b8769a4a742959a2d0298c36fb70623f2dfacda8436237df08d8dfd5b37374c" # pass123
+        "#;
+        fs::write(temp_users_file, updated_toml).unwrap();
+
+        // Reload the config manually (signal reloading is verified by compile and manual tests, but we verify reload logic here)
+        utils::reload_users_config(&app_state);
+
+        assert!(utils::check_basic_auth(&app_state, &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:supersecret"))));
+        assert!(utils::check_basic_auth(&app_state, &format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("bob:pass123"))));
+
+        let _ = fs::remove_file(temp_users_file);
+        unsafe {
+            std::env::remove_var("SGIT_USERS_FILE");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repo_storage_quota() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_quota_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        // Write a small file in the repo to simulate disk usage
+        let test_file = safe_path.join("large_dummy_file");
+        fs::write(&test_file, vec![0u8; 1024 * 1024]).unwrap(); // 1MB dummy file
+
+        // Set quota to 0 MB (exceeded)
+        unsafe {
+            std::env::set_var("SGIT_MAX_REPO_SIZE_MB", "0");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request("GET", &format!("/{}/info/refs?service=git-receive-pack", repo_name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        unsafe {
+            std::env::remove_var("SGIT_MAX_REPO_SIZE_MB");
         }
         let _ = std::fs::remove_dir_all(&safe_path);
     }

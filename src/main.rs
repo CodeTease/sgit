@@ -15,7 +15,7 @@ async fn main() {
         .await
         .unwrap_or_else(|_| panic!("Failed to bind to {}", addr));
 
-    println!("SGit server running at http://{}", addr);
+    sgit::log_stderr!("SGit server running at http://{}", addr);
     
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
@@ -24,9 +24,28 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C handler");
-    println!("Shutdown signal received, shutting down gracefully...");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    sgit::log_stderr!("Shutdown signal received, shutting down gracefully...");
 }
 
