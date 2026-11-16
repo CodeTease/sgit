@@ -110,6 +110,48 @@ mod tests {
             .extension(axum::extract::ConnectInfo(addr))
     }
 
+    /// Installs a fake git service executable at the front of PATH for the
+    /// lifetime of the guard (used to test timeouts deterministically).
+    #[cfg(unix)]
+    struct FakeGitService {
+        dir: std::path::PathBuf,
+        old_path: String,
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeGitService {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::set_var("PATH", &self.old_path);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_fake_git_service(name: &str, script: &str) -> FakeGitService {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sgit-fake-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join(name);
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", dir.display(), old_path);
+        unsafe {
+            std::env::set_var("PATH", new_path);
+        }
+
+        FakeGitService { dir, old_path }
+    }
+
     #[tokio::test]
     async fn test_health_check() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -783,6 +825,65 @@ mod tests {
         unsafe {
             std::env::remove_var("SGIT_READ_TIMEOUT");
         }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_timeout_kills_git_child() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let pid_file = std::env::temp_dir().join(format!(
+            "sgit-read-timeout-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        let _fake_git = install_fake_git_service("git-upload-pack", &script);
+
+        let repo_name = "test_read_timeout_killed_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        unsafe {
+            std::env::set_var("SGIT_READ_TIMEOUT", "1");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request(
+                    "GET",
+                    &format!("/{}/info/refs?service=git-upload-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        unsafe {
+            std::env::remove_var("SGIT_READ_TIMEOUT");
+        }
+
+        let pid = fs::read_to_string(&pid_file)
+            .expect("fake git service did not record its pid")
+            .trim()
+            .to_string();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid)).exists(),
+            "git child {} is still running after the read timeout",
+            pid
+        );
+
+        let _ = fs::remove_file(&pid_file);
         let _ = std::fs::remove_dir_all(&safe_path);
     }
 

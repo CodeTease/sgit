@@ -99,7 +99,10 @@ pub async fn handle_info_refs_internal(
     let mut cmd = Command::new(service);
     cmd.arg("--stateless-rpc")
         .arg("--advertise-refs")
-        .arg(&repo_path);
+        .arg(&repo_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // Support Git Protocol V2 if specified by client
     if let Some(protocol) = headers.get("Git-Protocol") {
@@ -114,15 +117,74 @@ pub async fn handle_info_refs_internal(
         .and_then(|val| val.parse::<u64>().ok())
         .unwrap_or(15);
 
-    let output = match tokio::time::timeout(
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to spawn git process")
+                .into_response();
+        }
+    };
+    let mut child_stdout = child.stdout.take().unwrap();
+    let mut child_stderr = child.stderr.take().unwrap();
+
+    // Drain both pipes concurrently so a large ref advertisement cannot fill
+    // the pipe buffers and deadlock the child.
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        child_stdout.read_to_end(&mut buf).await.map(|_| buf)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        child_stderr.read_to_end(&mut buf).await.map(|_| buf)
+    });
+
+    let status = match tokio::time::timeout(
         std::time::Duration::from_secs(read_timeout_secs),
-        cmd.output(),
+        child.wait(),
     )
     .await
     {
-        Ok(Ok(out)) if out.status.success() => out,
-        Ok(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Git execution error").into_response(),
-        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, "Request timed out").into_response(),
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Git execution error").into_response();
+        }
+        Err(_) => {
+            // The wait future is dropped above, so explicitly terminate and reap
+            // the child instead of leaving it running after the 504 response.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return (StatusCode::GATEWAY_TIMEOUT, "Request timed out").into_response();
+        }
+    };
+
+    let stdout = match stdout_task.await {
+        Ok(Ok(buf)) => buf,
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Git output error").into_response(),
+    };
+    let stderr = match stderr_task.await {
+        Ok(Ok(buf)) => buf,
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Git output error").into_response(),
+    };
+    if !status.success() {
+        if !stderr.is_empty() {
+            crate::log_stderr!(
+                "Git service [{}] stderr: {}",
+                service,
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Git execution error").into_response();
+    }
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
     };
 
     // Calculate pkt-line header using helper function
