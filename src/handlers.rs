@@ -134,7 +134,7 @@ async fn spool_request_body(
         } else {
             let path = temp_body_path();
             let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true);
+            options.read(true).write(true).create_new(true);
             #[cfg(unix)]
             options.mode(0o600);
             let mut writer = match options.open(&path).await {
@@ -676,5 +676,42 @@ pub async fn execute_git_service_stream(
     add_no_cache_headers(&mut res_headers);
 
     (StatusCode::OK, res_headers, response_body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn test_spool_request_body_rejects_oversized_body() {
+        let result = spool_request_body(Body::from(vec![0u8; 16]), 8).await;
+        assert!(
+            matches!(result, Err(StatusCode::PAYLOAD_TOO_LARGE)),
+            "body above the limit must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spool_request_body_spills_to_disk_and_cleans_up() {
+        let data = vec![0xABu8; BODY_MEMORY_SPOOL_THRESHOLD + 1024];
+        let (mut body, size) = spool_request_body(Body::from(data.clone()), u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(size, data.len() as u64);
+
+        let path = match &body {
+            SpooledRequestBody::File { path, .. } => path.clone(),
+            SpooledRequestBody::Memory(_) => panic!("large body should be spooled to a file"),
+        };
+        assert!(path.exists());
+
+        let mut copied = Vec::new();
+        body.read_to_end(&mut copied).await.unwrap();
+        assert_eq!(copied, data);
+
+        drop(body);
+        assert!(!path.exists(), "temporary body file was not removed");
+    }
 }
 
