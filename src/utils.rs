@@ -101,6 +101,27 @@ pub fn ensure_repo_exists(repo_path: &std::path::Path, is_push: bool) -> Result<
     Ok(())
 }
 
+/// Async wrapper that keeps filesystem/libgit2 work off runtime workers.
+pub async fn ensure_repo_exists_async(repo_path: PathBuf, is_push: bool) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || ensure_repo_exists(&repo_path, is_push)).await {
+        Ok(result) => result,
+        Err(_) => Err("Repository initialization task failed".to_string()),
+    }
+}
+
+/// Async wrapper for the recursive (blocking) repository size walk.
+pub async fn get_dir_size_async(path: PathBuf) -> std::io::Result<u64> {
+    match tokio::task::spawn_blocking(move || get_dir_size(&path)).await {
+        Ok(result) => result,
+        Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+    }
+}
+
+/// Async wrapper for the blocking libgit2 HEAD repair.
+pub async fn update_head_if_invalid_async(path: PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || update_head_if_invalid(&path)).await;
+}
+
 /// Encodes a data payload into Git's pkt-line format.
 pub fn pkt_line_encode(data: &[u8]) -> bytes::Bytes {
     let len = data.len();

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use futures_core::Stream;
 use bytes::Bytes;
 use tokio_util::io::ReaderStream;
-use crate::utils::{get_dir_size, get_repo_size_quota_bytes, update_head_if_invalid};
+use crate::utils::{
+    get_dir_size_async, get_repo_size_quota_bytes, update_head_if_invalid_async,
+};
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -111,13 +113,13 @@ impl Drop for GitResponseStream {
                 // Automatically check and update HEAD after the git process
                 // completes (also when the client disconnected after sending
                 // a complete push).
-                update_head_if_invalid(&path);
+                update_head_if_invalid_async(path.clone()).await;
 
                 // Re-check the quota after the push. A push accepted near the
                 // limit can still grow the repository beyond it; subsequent
                 // pushes are then rejected by the pre-push check.
                 if let Some(quota_bytes) = get_repo_size_quota_bytes() {
-                    if let Ok(size) = get_dir_size(&path) {
+                    if let Ok(size) = get_dir_size_async(path.clone()).await {
                         if size > quota_bytes {
                             crate::log_stderr!(
                                 "Repository {} is over quota ({} bytes > {} bytes)",

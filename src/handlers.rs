@@ -15,7 +15,10 @@ use tokio::sync::Notify;
 use tokio_util::io::ReaderStream;
 
 use crate::types::{spawn_idle_timeout, AppState, GitResponseStream};
-use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt_line_encode, update_head_if_invalid};
+use crate::utils::{
+    ensure_repo_exists_async, get_dir_size_async, get_safe_repo_path, pkt_line_encode,
+    update_head_if_invalid_async, validate_service,
+};
 
 // REST API: GET / (health check)
 pub async fn handle_health_check() -> impl IntoResponse {
@@ -237,7 +240,7 @@ pub async fn handle_info_refs_internal(
             .into_response();
     }
 
-    if let Err(err_msg) = ensure_repo_exists(&repo_path, is_push) {
+    if let Err(err_msg) = ensure_repo_exists_async(repo_path.clone(), is_push).await {
         let status = if err_msg.contains("does not exist") {
             StatusCode::NOT_FOUND
         } else {
@@ -245,10 +248,10 @@ pub async fn handle_info_refs_internal(
         };
         return (status, err_msg).into_response();
     }
-    update_head_if_invalid(&repo_path);
+    update_head_if_invalid_async(repo_path.clone()).await;
 
     if let Some(quota_bytes) = quota_bytes {
-        let current_size = match crate::utils::get_dir_size(&repo_path) {
+        let current_size = match get_dir_size_async(repo_path.clone()).await {
             Ok(size) => size,
             Err(_) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to measure repository")
@@ -484,7 +487,7 @@ pub async fn execute_git_service_stream(
     let mut repo_size_before_push = 0u64;
     if let Some(quota_bytes) = quota_bytes {
         repo_size_before_push = if repo_path.exists() {
-            match crate::utils::get_dir_size(&repo_path) {
+            match get_dir_size_async(repo_path.clone()).await {
                 Ok(size) => size,
                 Err(_) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to measure repository")
@@ -503,7 +506,7 @@ pub async fn execute_git_service_stream(
         }
     }
 
-    if let Err(err_msg) = ensure_repo_exists(&repo_path, is_push) {
+    if let Err(err_msg) = ensure_repo_exists_async(repo_path.clone(), is_push).await {
         let status = if err_msg.contains("does not exist") {
             StatusCode::NOT_FOUND
         } else {
