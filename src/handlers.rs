@@ -207,16 +207,20 @@ pub async fn execute_git_service_stream(
         }
     }
 
-    // Enforce Push Size Limit (Max Request Body)
+    // Enforce Push Size Limit (Max Request Body). A value of 0 disables the limit.
     let max_request_size_mb = std::env::var("SGIT_MAX_REQUEST_SIZE_MB")
         .ok()
-        .and_then(|val| val.parse::<usize>().ok())
+        .and_then(|val| val.parse::<u64>().ok())
         .unwrap_or(500);
-    let limit_bytes = max_request_size_mb * 1024 * 1024;
+    let limit_bytes = if max_request_size_mb == 0 {
+        u64::MAX
+    } else {
+        max_request_size_mb.saturating_mul(1024 * 1024)
+    };
 
     if let Some(content_length) = headers.get(header::CONTENT_LENGTH) {
         if let Ok(cl_str) = content_length.to_str() {
-            if let Ok(cl) = cl_str.parse::<usize>() {
+            if let Ok(cl) = cl_str.parse::<u64>() {
                 if cl > limit_bytes {
                     return StatusCode::PAYLOAD_TOO_LARGE.into_response();
                 }
@@ -281,7 +285,7 @@ pub async fn execute_git_service_stream(
                 res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
             })
         );
-        let mut limited_reader = body_reader.take(limit_bytes as u64);
+        let mut limited_reader = body_reader.take(limit_bytes);
         tokio::select! {
             _ = stdin_token.cancelled() => {},
             _ = tokio::io::copy(&mut limited_reader, &mut child_stdin) => {}

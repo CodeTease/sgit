@@ -38,20 +38,29 @@ pub fn app() -> Router {
         .route("/", get(handle_health_check))
         .merge(git_routes);
 
-    // 1. Push Size Limit (Max Request Body)
+    // 1. Push Size Limit (Max Request Body).
+    // A value of 0 disables the limit instead of rejecting every non-empty body.
     let max_request_size_mb = std::env::var("SGIT_MAX_REQUEST_SIZE_MB")
         .ok()
         .and_then(|val| val.parse::<usize>().ok())
         .unwrap_or(500);
-    let limit_bytes = max_request_size_mb * 1024 * 1024;
-    app = app.layer(axum::extract::DefaultBodyLimit::max(limit_bytes));
+    if max_request_size_mb > 0 {
+        let limit_bytes = max_request_size_mb.saturating_mul(1024 * 1024);
+        app = app.layer(axum::extract::DefaultBodyLimit::max(limit_bytes));
+    } else {
+        app = app.layer(axum::extract::DefaultBodyLimit::disable());
+    }
 
-    // 2. Concurrency Limit
+    // 2. Concurrency Limit.
+    // A value of 0 disables the limit; ConcurrencyLimitLayer::new(0) would
+    // otherwise park every request forever.
     let max_concurrent_reqs = std::env::var("SGIT_MAX_CONCURRENT_REQS")
         .ok()
         .and_then(|val| val.parse::<usize>().ok())
         .unwrap_or(20);
-    app = app.layer(tower::limit::ConcurrencyLimitLayer::new(max_concurrent_reqs));
+    if max_concurrent_reqs > 0 {
+        app = app.layer(tower::limit::ConcurrencyLimitLayer::new(max_concurrent_reqs));
+    }
 
     // 3. Rate Limiting
     let rate_limit = std::env::var("SGIT_RATE_LIMIT_PER_IP")
@@ -550,6 +559,55 @@ mod tests {
 
         unsafe {
             std::env::remove_var("SGIT_RATE_LIMIT_PER_IP");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_concurrency_and_request_size_disable_limits() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("SGIT_MAX_CONCURRENT_REQS", "0");
+            std::env::set_var("SGIT_MAX_REQUEST_SIZE_MB", "0");
+        }
+        let app = app();
+
+        // The request must not be parked forever by a zero-permit semaphore.
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.clone().oneshot(
+                mock_request("GET", "/")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("request hung with SGIT_MAX_CONCURRENT_REQS=0")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A non-empty body must not be rejected when the size limit is disabled.
+        let repo_name = "test_zero_limit_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
+                    .header("content-length", "1024")
+                    .body(Body::from(vec![0u8; 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let _ = std::fs::remove_dir_all(&safe_path);
+        unsafe {
+            std::env::remove_var("SGIT_MAX_CONCURRENT_REQS");
+            std::env::remove_var("SGIT_MAX_REQUEST_SIZE_MB");
         }
     }
 
