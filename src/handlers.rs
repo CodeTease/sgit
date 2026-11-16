@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query},
-    http::{header, HeaderMap, StatusCode, Method},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Method},
     response::{IntoResponse, Response},
 };
 use std::{collections::HashMap, process::Stdio};
@@ -14,6 +14,20 @@ use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt
 // REST API: GET / (health check)
 pub async fn handle_health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
+}
+
+// Git ref advertisements and RPC results are dynamic and security-sensitive.
+// Prevent reverse proxies and clients from caching them.
+fn add_no_cache_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, max-age=0, must-revalidate"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        header::EXPIRES,
+        HeaderValue::from_static("Fri, 01 Jan 1980 00:00:00 GMT"),
+    );
 }
 
 // Catch-all Git handler supporting arbitrary nested namespaces/subfolders
@@ -127,6 +141,7 @@ pub async fn handle_info_refs_internal(
             .parse()
             .unwrap(),
     );
+    add_no_cache_headers(&mut res_headers);
 
     (StatusCode::OK, res_headers, body).into_response()
 }
@@ -302,6 +317,7 @@ pub async fn execute_git_service_stream(
             .parse()
             .unwrap(),
     );
+    add_no_cache_headers(&mut res_headers);
 
     (StatusCode::OK, res_headers, response_body).into_response()
 }

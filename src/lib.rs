@@ -251,6 +251,18 @@ mod tests {
         
         let content_type = response.headers().get("content-type").unwrap().to_str().unwrap();
         assert_eq!(content_type, "application/x-git-upload-pack-advertisement");
+        assert_eq!(
+            response.headers().get("cache-control").unwrap().to_str().unwrap(),
+            "no-cache, max-age=0, must-revalidate"
+        );
+        assert_eq!(
+            response.headers().get("pragma").unwrap().to_str().unwrap(),
+            "no-cache"
+        );
+        assert_eq!(
+            response.headers().get("expires").unwrap().to_str().unwrap(),
+            "Fri, 01 Jan 1980 00:00:00 GMT"
+        );
 
         let body = axum::body::to_bytes(response.into_body(), 1000000)
             .await
