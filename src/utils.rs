@@ -7,7 +7,7 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode, header, HeaderValue},
     middleware::Next,
-    extract::State,
+    extract::{FromRequestParts, Path, Query, State},
 };
 use sha2::{Sha256, Digest};
 use crate::types::AppState;
@@ -220,10 +220,31 @@ pub async fn git_auth_middleware(
     next: Next,
 ) -> Response<Body> {
     if state.has_users_file.load(Ordering::SeqCst) {
-        let path = request.uri().path();
-        let query = request.uri().query().unwrap_or("");
-        let is_write = path.ends_with("/git-receive-pack")
-            || (path.ends_with("/info/refs") && query.contains("service=git-receive-pack"));
+        // Route on the same percent-decoded values that handle_git_request sees.
+        // The raw URI must never be used for authorization: an encoded form such
+        // as `git%2Dreceive-pack` decodes to a write endpoint in the handler.
+        let (mut parts, body) = request.into_parts();
+        let decoded_path =
+            Path::<String>::from_request_parts(&mut parts, &state)
+                .await
+                .map(|Path(path)| path);
+        let decoded_service =
+            Query::<HashMap<String, String>>::from_request_parts(&mut parts, &state)
+                .await
+                .ok()
+                .and_then(|Query(params)| params.get("service").cloned());
+        let request = Request::from_parts(parts, body);
+
+        let is_write = match decoded_path {
+            Ok(path) => {
+                path.ends_with("/git-receive-pack")
+                    || (path.ends_with("/info/refs")
+                        && decoded_service.as_deref() == Some("git-receive-pack"))
+            }
+            // Fail closed if the request target cannot be decoded: the handler
+            // cannot safely dispatch it either.
+            Err(_) => true,
+        };
 
         if !is_write {
             // Allow public clone / read

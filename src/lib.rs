@@ -471,6 +471,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_percent_encoded_receive_pack_requires_auth() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let temp_users_file = "temp_encoded_users.toml";
+        unsafe {
+            std::env::set_var("SGIT_USERS_FILE", temp_users_file);
+        }
+        fs::write(
+            temp_users_file,
+            r#"
+                [users]
+                alice = "f75778f7425be4db0369d09af37a6c2b9a83dea0e53e7bd57412e4b060e607f7" # supersecret
+            "#,
+        )
+        .unwrap();
+
+        let app = app();
+        let repo_name = "encoded_auth_test_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+
+        // Percent-encoded write endpoints must be protected exactly like their
+        // canonical forms (B1).
+        for uri in [
+            format!("/{}/git%2Dreceive-pack", repo_name),
+            format!("/{}/git%2dreceive-pack", repo_name),
+            format!("/{}%2Fgit-receive-pack", repo_name),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    mock_request("POST", &uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "percent-encoded write endpoint was not protected: {uri}"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request(
+                    "GET",
+                    &format!("/{}/info/refs?service=git%2Dreceive-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Rejected requests must not auto-create the repository.
+        assert!(!safe_path.exists());
+
+        // An authenticated encoded request must still reach the handler.
+        let auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:supersecret")
+        );
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git%2Dreceive-pack", repo_name))
+                    .header("Authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&safe_path);
+        let _ = fs::remove_file(temp_users_file);
+        unsafe {
+            std::env::remove_var("SGIT_USERS_FILE");
+        }
+    }
+
+    #[tokio::test]
     async fn test_env_timeout_and_port() {
         let _guard = TEST_LOCK.lock().unwrap();
         // Test timeout parsing logic from env in a simple way
