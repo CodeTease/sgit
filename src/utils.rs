@@ -56,6 +56,14 @@ pub fn get_safe_repo_path(repo_name: &str) -> Option<PathBuf> {
     Some(base_path.join(normalized))
 }
 
+/// Parsed `SGIT_MAX_REPO_SIZE_MB` (bytes). `None` means unlimited.
+pub fn get_repo_size_quota_bytes() -> Option<u64> {
+    std::env::var("SGIT_MAX_REPO_SIZE_MB")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+}
+
 // Auto-initialize helper
 pub fn get_dir_size(path: &std::path::Path) -> std::io::Result<u64> {
     let mut total_size = 0;

@@ -607,6 +607,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_zero_quota_does_not_auto_create_repo() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_zero_quota_new_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+
+        unsafe {
+            std::env::set_var("SGIT_MAX_REPO_SIZE_MB", "0");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request(
+                    "GET",
+                    &format!("/{}/info/refs?service=git-receive-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            !safe_path.exists(),
+            "a quota rejection must not leave an auto-created repository behind"
+        );
+
+        unsafe {
+            std::env::remove_var("SGIT_MAX_REPO_SIZE_MB");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
+    async fn test_quota_counts_the_incoming_body_before_push() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_quota_body_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+
+        unsafe {
+            std::env::set_var("SGIT_MAX_REPO_SIZE_MB", "1");
+            std::env::set_var("SGIT_MAX_REQUEST_SIZE_MB", "10");
+        }
+        let app = app();
+
+        // 2 MB body against a 1 MB quota, with no Content-Length (chunked-style).
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-receive-pack", repo_name))
+                    .body(Body::from(vec![0u8; 2 * 1024 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            !safe_path.exists(),
+            "the repository must not be created when the push already exceeds its quota"
+        );
+
+        unsafe {
+            std::env::remove_var("SGIT_MAX_REPO_SIZE_MB");
+            std::env::remove_var("SGIT_MAX_REQUEST_SIZE_MB");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
     async fn test_argon2_and_legacy_password_verification() {
         let _guard = TEST_LOCK.lock().unwrap();
 

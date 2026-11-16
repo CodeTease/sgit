@@ -224,6 +224,19 @@ pub async fn handle_info_refs_internal(
     };
 
     let is_push = service == "git-receive-pack";
+    let quota_bytes = if is_push {
+        crate::utils::get_repo_size_quota_bytes()
+    } else {
+        None
+    };
+
+    // Do not auto-create a repository that would immediately be over quota
+    // (a zero-byte quota rejects even the empty repository).
+    if is_push && !repo_path.exists() && quota_bytes == Some(0) {
+        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded")
+            .into_response();
+    }
+
     if let Err(err_msg) = ensure_repo_exists(&repo_path, is_push) {
         let status = if err_msg.contains("does not exist") {
             StatusCode::NOT_FOUND
@@ -234,16 +247,17 @@ pub async fn handle_info_refs_internal(
     }
     update_head_if_invalid(&repo_path);
 
-    if is_push {
-        if let Ok(quota_val) = std::env::var("SGIT_MAX_REPO_SIZE_MB") {
-            if let Ok(quota_mb) = quota_val.parse::<u64>() {
-                let quota_bytes = quota_mb * 1024 * 1024;
-                if let Ok(current_size) = crate::utils::get_dir_size(&repo_path) {
-                    if current_size >= quota_bytes {
-                        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded").into_response();
-                    }
-                }
+    if let Some(quota_bytes) = quota_bytes {
+        let current_size = match crate::utils::get_dir_size(&repo_path) {
+            Ok(size) => size,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to measure repository")
+                    .into_response();
             }
+        };
+        if current_size >= quota_bytes {
+            return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded")
+                .into_response();
         }
     }
 
@@ -459,6 +473,36 @@ pub async fn execute_git_service_stream(
         Err(status) => return status.into_response(),
     };
 
+    // Enforce the per-repository quota before auto-creation and before spawning
+    // git. The incoming body (including the pack for a push) is counted against
+    // the remaining space so a single push cannot blow past the quota.
+    let quota_bytes = if is_push {
+        crate::utils::get_repo_size_quota_bytes()
+    } else {
+        None
+    };
+    let mut repo_size_before_push = 0u64;
+    if let Some(quota_bytes) = quota_bytes {
+        repo_size_before_push = if repo_path.exists() {
+            match crate::utils::get_dir_size(&repo_path) {
+                Ok(size) => size,
+                Err(_) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to measure repository")
+                        .into_response();
+                }
+            }
+        } else {
+            0
+        };
+
+        if repo_size_before_push >= quota_bytes
+            || repo_size_before_push.saturating_add(body_size) > quota_bytes
+        {
+            return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded")
+                .into_response();
+        }
+    }
+
     if let Err(err_msg) = ensure_repo_exists(&repo_path, is_push) {
         let status = if err_msg.contains("does not exist") {
             StatusCode::NOT_FOUND
@@ -468,27 +512,32 @@ pub async fn execute_git_service_stream(
         return (status, err_msg).into_response();
     }
 
-    if is_push {
-        if let Ok(quota_val) = std::env::var("SGIT_MAX_REPO_SIZE_MB") {
-            if let Ok(quota_mb) = quota_val.parse::<u64>() {
-                let quota_bytes = quota_mb * 1024 * 1024;
-                if let Ok(current_size) = crate::utils::get_dir_size(&repo_path) {
-                    if current_size >= quota_bytes {
-                        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded").into_response();
-                    }
-                }
-            }
-        }
-    }
-    // Body size is used by the repository quota enforcement (B10).
-    let _ = body_size;
-
     let mut cmd = Command::new(service);
     cmd.arg("--stateless-rpc")
         .arg(&repo_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Enforce the remaining quota while receive-pack unpacks, so a pack that
+    // expands beyond the advertised body size is also stopped by git.
+    if let Some(remaining_bytes) =
+        quota_bytes.map(|quota| quota.saturating_sub(repo_size_before_push))
+    {
+        let config_count = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(0);
+        cmd.env("GIT_CONFIG_COUNT", (config_count + 1).to_string())
+            .env(
+                format!("GIT_CONFIG_KEY_{}", config_count),
+                "receive.maxInputSize",
+            )
+            .env(
+                format!("GIT_CONFIG_VALUE_{}", config_count),
+                remaining_bytes.to_string(),
+            );
+    }
 
     // Pass Git-Protocol header if present
     if let Some(protocol) = headers.get("Git-Protocol") {
