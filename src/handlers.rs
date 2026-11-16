@@ -169,6 +169,19 @@ async fn spool_request_body(
     }
 }
 
+/// Strip exactly one endpoint suffix and reject non-canonical paths that still
+/// end in an endpoint segment (e.g. `/repo/info/refs/info/refs`).
+fn strip_endpoint_suffix<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let repo = path.strip_suffix(suffix)?;
+    if repo.ends_with("/info/refs")
+        || repo.ends_with("/git-upload-pack")
+        || repo.ends_with("/git-receive-pack")
+    {
+        return None;
+    }
+    Some(repo)
+}
+
 // Catch-all Git handler supporting arbitrary nested namespaces/subfolders
 pub async fn handle_git_request(
     State(state): State<AppState>,
@@ -179,11 +192,11 @@ pub async fn handle_git_request(
     body: Body,
 ) -> Response {
     if method == Method::GET {
-        if let Some(repo) = path.strip_suffix("/info/refs") {
+        if let Some(repo) = strip_endpoint_suffix(&path, "/info/refs") {
             return handle_info_refs_internal(repo.to_string(), params, headers).await;
         }
     } else if method == Method::POST {
-        if let Some(repo) = path.strip_suffix("/git-upload-pack") {
+        if let Some(repo) = strip_endpoint_suffix(&path, "/git-upload-pack") {
             return execute_git_service_stream(
                 repo.to_string(),
                 "git-upload-pack",
@@ -193,7 +206,7 @@ pub async fn handle_git_request(
             )
             .await;
         }
-        if let Some(repo) = path.strip_suffix("/git-receive-pack") {
+        if let Some(repo) = strip_endpoint_suffix(&path, "/git-receive-pack") {
             return execute_git_service_stream(
                 repo.to_string(),
                 "git-receive-pack",

@@ -252,6 +252,46 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+        // The same applies to write paths, which must not auto-create a nested
+        // repository named after an endpoint.
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request(
+                    "POST",
+                    &format!("/{}/git-receive-pack/git-receive-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request(
+                    "GET",
+                    &format!(
+                        "/{}/info/refs/info/refs?service=git-receive-pack",
+                        repo_name
+                    ),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        assert!(!get_safe_repo_path(&format!("{}/git-receive-pack", repo_name))
+            .unwrap()
+            .exists());
+        assert!(!get_safe_repo_path(&format!("{}/info/refs", repo_name))
+            .unwrap()
+            .exists());
+
         // The canonical endpoint must still work.
         let response = app
             .oneshot(
