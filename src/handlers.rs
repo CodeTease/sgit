@@ -316,8 +316,8 @@ pub async fn handle_info_refs_internal(
     {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => {
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            stdout_task.abort();
+            stderr_task.abort();
             return (StatusCode::INTERNAL_SERVER_ERROR, "Git execution error").into_response();
         }
         Err(_) => {
@@ -325,8 +325,12 @@ pub async fn handle_info_refs_internal(
             // the child instead of leaving it running after the 504 response.
             let _ = child.start_kill();
             let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            // A grandchild (for example a `sleep` started by a wrapper script)
+            // may still hold the pipes open. Abort the readers so the timeout
+            // response is returned immediately rather than after that process
+            // exits.
+            stdout_task.abort();
+            stderr_task.abort();
             return (StatusCode::GATEWAY_TIMEOUT, "Request timed out").into_response();
         }
     };

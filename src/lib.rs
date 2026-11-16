@@ -937,8 +937,11 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_file(&pid_file);
+        // Deliberately do not `exec`: the shell's `sleep` child inherits the
+        // pipe descriptors, so the handler must not wait for it before
+        // returning the timeout response.
         let script = format!(
-            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            "#!/bin/sh\necho $$ > '{}'\nsleep 5\n",
             pid_file.display()
         );
         let _fake_git = install_fake_git_service("git-upload-pack", &script);
@@ -955,6 +958,7 @@ mod tests {
         }
         let app = app();
 
+        let started = std::time::Instant::now();
         let response = app
             .oneshot(
                 mock_request(
@@ -966,7 +970,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let elapsed = started.elapsed();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "timeout response was delayed by descendants holding the pipes: {:?}",
+            elapsed
+        );
 
         unsafe {
             std::env::remove_var("SGIT_READ_TIMEOUT");
