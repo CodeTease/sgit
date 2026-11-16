@@ -4,12 +4,15 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode, Method},
     response::{IntoResponse, Response},
 };
-use std::{collections::HashMap, process::Stdio};
-use std::sync::atomic::AtomicBool;
+use std::{collections::HashMap, path::PathBuf, process::Stdio};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::process::Command;
 use tokio::sync::Notify;
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::ReaderStream;
 
 use crate::types::{spawn_idle_timeout, AppState, GitResponseStream};
 use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt_line_encode, update_head_if_invalid};
@@ -31,6 +34,136 @@ fn add_no_cache_headers(headers: &mut HeaderMap) {
         header::EXPIRES,
         HeaderValue::from_static("Fri, 01 Jan 1980 00:00:00 GMT"),
     );
+}
+
+/// Request bodies above this size are spooled to a temp file instead of RAM.
+const BODY_MEMORY_SPOOL_THRESHOLD: usize = 8 * 1024 * 1024;
+static TEMP_BODY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A fully buffered request body, either in memory or in a temp file.
+/// Files are removed when the body is dropped (after being fed to git).
+enum SpooledRequestBody {
+    Memory(std::io::Cursor<Vec<u8>>),
+    File { file: tokio::fs::File, path: PathBuf },
+}
+
+impl Drop for SpooledRequestBody {
+    fn drop(&mut self) {
+        if let SpooledRequestBody::File { path, .. } = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl AsyncRead for SpooledRequestBody {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            SpooledRequestBody::Memory(cursor) => Pin::new(cursor).poll_read(cx, buf),
+            SpooledRequestBody::File { file, .. } => Pin::new(file).poll_read(cx, buf),
+        }
+    }
+}
+
+fn temp_body_path() -> PathBuf {
+    let seq = TEMP_BODY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sgit-request-{}-{}-{}.tmp",
+        std::process::id(),
+        now,
+        seq
+    ))
+}
+
+/// Read the complete request body, enforcing `limit_bytes` by counting the
+/// actual bytes received. `Content-Length` cannot be trusted here because git
+/// uses `Transfer-Encoding: chunked`, which axum's `DefaultBodyLimit` does not
+/// apply to when the handler consumes `Body` directly.
+///
+/// Returning a `413` is only possible before response headers are sent, so the
+/// body must be fully received first. Large bodies are spooled to disk.
+async fn spool_request_body(
+    body: Body,
+    limit_bytes: u64,
+) -> Result<(SpooledRequestBody, u64), StatusCode> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let mut stream = body.into_data_stream();
+    let mut total: u64 = 0;
+    let mut memory: Vec<u8> = Vec::new();
+    let mut file: Option<(tokio::fs::File, PathBuf)> = None;
+
+    while let Some(chunk) = tokio_stream::StreamExt::next(&mut stream).await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                if let Some((_, path)) = file.take() {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+
+        total = total.saturating_add(chunk.len() as u64);
+        if total > limit_bytes {
+            if let Some((_, path)) = file.take() {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        if let Some((writer, _)) = file.as_mut() {
+            if writer.write_all(&chunk).await.is_err() {
+                if let Some((_, path)) = file.take() {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        } else if memory.len().saturating_add(chunk.len()) <= BODY_MEMORY_SPOOL_THRESHOLD {
+            memory.extend_from_slice(&chunk);
+        } else {
+            let path = temp_body_path();
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut writer = match options.open(&path).await {
+                Ok(writer) => writer,
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+            if writer.write_all(&memory).await.is_err()
+                || writer.write_all(&chunk).await.is_err()
+            {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            memory.clear();
+            memory.shrink_to_fit();
+            file = Some((writer, path));
+        }
+    }
+
+    if let Some((mut writer, path)) = file {
+        if writer.flush().await.is_err()
+            || writer
+                .seek(std::io::SeekFrom::Start(0))
+                .await
+                .is_err()
+        {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Ok((SpooledRequestBody::File { file: writer, path }, total))
+    } else {
+        Ok((SpooledRequestBody::Memory(std::io::Cursor::new(memory)), total))
+    }
 }
 
 // Catch-all Git handler supporting arbitrary nested namespaces/subfolders
@@ -297,27 +430,6 @@ pub async fn execute_git_service_stream(
     };
 
     let is_push = service == "git-receive-pack";
-    if let Err(err_msg) = ensure_repo_exists(&repo_path, is_push) {
-        let status = if err_msg.contains("does not exist") {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return (status, err_msg).into_response();
-    }
-
-    if is_push {
-        if let Ok(quota_val) = std::env::var("SGIT_MAX_REPO_SIZE_MB") {
-            if let Ok(quota_mb) = quota_val.parse::<u64>() {
-                let quota_bytes = quota_mb * 1024 * 1024;
-                if let Ok(current_size) = crate::utils::get_dir_size(&repo_path) {
-                    if current_size >= quota_bytes {
-                        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded").into_response();
-                    }
-                }
-            }
-        }
-    }
 
     // Enforce Push Size Limit (Max Request Body). A value of 0 disables the limit.
     let max_request_size_mb = std::env::var("SGIT_MAX_REQUEST_SIZE_MB")
@@ -339,6 +451,37 @@ pub async fn execute_git_service_stream(
             }
         }
     }
+
+    // Buffer the complete body (or spool it to disk) so an oversized chunked
+    // request can be rejected with 413 before any git process is spawned.
+    let (request_body, body_size) = match spool_request_body(body, limit_bytes).await {
+        Ok(body) => body,
+        Err(status) => return status.into_response(),
+    };
+
+    if let Err(err_msg) = ensure_repo_exists(&repo_path, is_push) {
+        let status = if err_msg.contains("does not exist") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (status, err_msg).into_response();
+    }
+
+    if is_push {
+        if let Ok(quota_val) = std::env::var("SGIT_MAX_REPO_SIZE_MB") {
+            if let Ok(quota_mb) = quota_val.parse::<u64>() {
+                let quota_bytes = quota_mb * 1024 * 1024;
+                if let Ok(current_size) = crate::utils::get_dir_size(&repo_path) {
+                    if current_size >= quota_bytes {
+                        return (StatusCode::INSUFFICIENT_STORAGE, "Repository storage quota exceeded").into_response();
+                    }
+                }
+            }
+        }
+    }
+    // Body size is used by the repository quota enforcement (B10).
+    let _ = body_size;
 
     let mut cmd = Command::new(service);
     cmd.arg("--stateless-rpc")
@@ -390,27 +533,21 @@ pub async fn execute_git_service_stream(
         }
     });
 
-    // Stream Axum Body directly into process stdin in background task. Each
-    // written chunk counts as progress for the idle timeout, so a long upload
-    // is not mistaken for a stalled stream.
+    // Feed the already-buffered request into process stdin. Each written chunk
+    // counts as progress for the idle timeout, so a long upload is not mistaken
+    // for a stalled stream.
     let stdin_token = cancellation_token.clone();
     let stdin_activity = activity.clone();
+    let mut request_body = request_body;
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let body_stream = body.into_data_stream();
-        let body_reader = StreamReader::new(
-            tokio_stream::StreamExt::map(body_stream, |res| {
-                res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            })
-        );
-        let mut limited_reader = body_reader.take(limit_bytes);
         let mut buf = vec![0u8; 64 * 1024];
 
         tokio::select! {
             _ = stdin_token.cancelled() => {}
             _ = async {
                 loop {
-                    match limited_reader.read(&mut buf).await {
+                    match request_body.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
                             if child_stdin.write_all(&buf[..n]).await.is_err() {

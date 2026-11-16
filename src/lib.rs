@@ -783,13 +783,28 @@ mod tests {
         }
         let app = app();
 
-        // Body larger than 1MB
+        // Body larger than 1MB, with Content-Length.
         let large_bytes = vec![0u8; 1100 * 1024];
         let len = large_bytes.len();
         let response = app
+            .clone()
             .oneshot(
                 mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
                     .header("content-length", len.to_string())
+                    .body(Body::from(large_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Same oversized body without Content-Length (as sent by real git
+        // pushes using Transfer-Encoding: chunked). It must still be rejected
+        // with 413 rather than being truncated and fed to git.
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
                     .body(Body::from(large_bytes))
                     .unwrap(),
             )
