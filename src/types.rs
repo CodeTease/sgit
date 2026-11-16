@@ -17,6 +17,9 @@ use tokio::sync::Notify;
 pub struct AppState {
     pub users: Arc<RwLock<HashMap<String, String>>>,
     pub has_users_file: Arc<AtomicBool>,
+    /// Bounds concurrently running git processes. A permit is held for the
+    /// entire response-body lifetime, not just until response headers.
+    pub git_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 type SharedChild = Arc<Mutex<Option<tokio::process::Child>>>;
@@ -43,6 +46,8 @@ pub struct GitResponseStream {
     pub repo_path: Option<PathBuf>,
     /// True once stdout reached EOF, i.e. the body completed normally.
     pub completed: bool,
+    /// Concurrency permit held until the git process is reaped.
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Stream for GitResponseStream {
@@ -73,6 +78,7 @@ impl Drop for GitResponseStream {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
 
+        let permit = self.permit.take();
         let child = match self.child.lock() {
             Ok(mut slot) => slot.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -96,6 +102,10 @@ impl Drop for GitResponseStream {
                 }
             };
             let exited_successfully = status.map(|s| s.success()).unwrap_or(false);
+
+            // Release the concurrency slot only after the process has really
+            // exited, not when the client disconnected.
+            drop(permit);
 
             if let Some(path) = repo_path {
                 // Automatically check and update HEAD after the git process

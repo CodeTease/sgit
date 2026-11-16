@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Method},
     response::{IntoResponse, Response},
 };
@@ -11,7 +11,7 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use crate::types::{spawn_idle_timeout, GitResponseStream};
+use crate::types::{spawn_idle_timeout, AppState, GitResponseStream};
 use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt_line_encode, update_head_if_invalid};
 
 // REST API: GET / (health check)
@@ -35,6 +35,7 @@ fn add_no_cache_headers(headers: &mut HeaderMap) {
 
 // Catch-all Git handler supporting arbitrary nested namespaces/subfolders
 pub async fn handle_git_request(
+    State(state): State<AppState>,
     Path(path): Path<String>,
     method: Method,
     Query(params): Query<HashMap<String, String>>,
@@ -47,10 +48,24 @@ pub async fn handle_git_request(
         }
     } else if method == Method::POST {
         if let Some(repo) = path.strip_suffix("/git-upload-pack") {
-            return execute_git_service_stream(repo.to_string(), "git-upload-pack", headers, body).await;
+            return execute_git_service_stream(
+                repo.to_string(),
+                "git-upload-pack",
+                headers,
+                body,
+                state.git_semaphore.clone(),
+            )
+            .await;
         }
         if let Some(repo) = path.strip_suffix("/git-receive-pack") {
-            return execute_git_service_stream(repo.to_string(), "git-receive-pack", headers, body).await;
+            return execute_git_service_stream(
+                repo.to_string(),
+                "git-receive-pack",
+                headers,
+                body,
+                state.git_semaphore.clone(),
+            )
+            .await;
         }
     }
 
@@ -222,20 +237,36 @@ pub async fn handle_info_refs(
 
 // 2. Upload pack handler (Fetch/Clone)
 pub async fn handle_upload_pack(
+    State(state): State<AppState>,
     Path(repo): Path<String>,
     headers: HeaderMap,
     body: Body,
 ) -> impl IntoResponse {
-    execute_git_service_stream(repo, "git-upload-pack", headers, body).await
+    execute_git_service_stream(
+        repo,
+        "git-upload-pack",
+        headers,
+        body,
+        state.git_semaphore.clone(),
+    )
+    .await
 }
 
 // 3. Receive pack handler (Push)
 pub async fn handle_receive_pack(
+    State(state): State<AppState>,
     Path(repo): Path<String>,
     headers: HeaderMap,
     body: Body,
 ) -> impl IntoResponse {
-    execute_git_service_stream(repo, "git-receive-pack", headers, body).await
+    execute_git_service_stream(
+        repo,
+        "git-receive-pack",
+        headers,
+        body,
+        state.git_semaphore.clone(),
+    )
+    .await
 }
 
 // Helper to execute Git process asynchronously with full bi-directional streaming
@@ -244,9 +275,25 @@ pub async fn execute_git_service_stream(
     service: &'static str,
     headers: HeaderMap,
     body: Body,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Response {
     let Some(repo_path) = get_safe_repo_path(&repo) else {
         return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
+    };
+
+    // Hold this permit for the complete process/body lifetime. The request
+    // concurrency layer releases its permit as soon as response headers are
+    // produced, which is far too early for a streaming git transfer.
+    let permit = if let Some(semaphore) = semaphore {
+        match semaphore.acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "Git service unavailable")
+                    .into_response();
+            }
+        }
+    } else {
+        None
     };
 
     let is_push = service == "git-receive-pack";
@@ -409,6 +456,7 @@ pub async fn execute_git_service_stream(
         // Only update HEAD if the service is git-receive-pack (Push)
         repo_path: if is_push { Some(repo_path.clone()) } else { None },
         completed: false,
+        permit,
     };
     let response_body = Body::from_stream(response_stream);
 

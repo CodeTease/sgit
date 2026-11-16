@@ -11,7 +11,19 @@ use handlers::*;
 use utils::git_auth_middleware;
 
 pub fn app() -> Router {
-    let state = utils::load_users_config();
+    let mut state = utils::load_users_config();
+
+    // The semaphore is shared by all git handlers and held for the lifetime of
+    // each git process/response stream (see GitResponseStream::permit).
+    let max_concurrent_reqs = std::env::var("SGIT_MAX_CONCURRENT_REQS")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(20);
+    if max_concurrent_reqs > 0 {
+        state.git_semaphore = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(
+            max_concurrent_reqs,
+        )));
+    }
 
     // SIGHUP Config Reload
     #[cfg(unix)]
@@ -51,13 +63,9 @@ pub fn app() -> Router {
         app = app.layer(axum::extract::DefaultBodyLimit::disable());
     }
 
-    // 2. Concurrency Limit.
-    // A value of 0 disables the limit; ConcurrencyLimitLayer::new(0) would
-    // otherwise park every request forever.
-    let max_concurrent_reqs = std::env::var("SGIT_MAX_CONCURRENT_REQS")
-        .ok()
-        .and_then(|val| val.parse::<usize>().ok())
-        .unwrap_or(20);
+    // 2. Request concurrency limit (the git-process limit is enforced by the
+    // semaphore held in GitResponseStream). A value of 0 disables the limit;
+    // ConcurrencyLimitLayer::new(0) would otherwise park every request forever.
     if max_concurrent_reqs > 0 {
         app = app.layer(tower::limit::ConcurrencyLimitLayer::new(max_concurrent_reqs));
     }
@@ -1095,6 +1103,94 @@ mod tests {
             std::env::remove_var("SGIT_STREAM_TIMEOUT");
         }
         let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stream_concurrency_permit_held_for_body_lifetime() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        // Headers are produced immediately, but the process lives for ~1 s.
+        let script = "#!/bin/sh\nprintf x\nsleep 1\n";
+        let _fake_git = install_fake_git_service("git-upload-pack", script);
+
+        let repo_one = "test_concurrency_permit_one";
+        let repo_two = "test_concurrency_permit_two";
+        for repo in [repo_one, repo_two] {
+            let safe_path = get_safe_repo_path(repo).unwrap();
+            if safe_path.exists() {
+                let _ = std::fs::remove_dir_all(&safe_path);
+            }
+            let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("SGIT_MAX_CONCURRENT_REQS", "1");
+            std::env::set_var("SGIT_STREAM_TIMEOUT", "0");
+            std::env::remove_var("SGIT_TIMEOUT");
+        }
+        let app = app();
+
+        let response_one = app
+            .clone()
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_one))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_one.status(), StatusCode::OK);
+
+        // The first response body has not been consumed yet, so the first git
+        // process still holds the only concurrency permit.
+        let uri_two = format!("/{}/git-upload-pack", repo_two);
+        let second = tokio::spawn(async move {
+            app.oneshot(
+                mock_request("POST", &uri_two)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "second git request did not wait for the first stream's permit"
+        );
+
+        // Completing the first stream releases the permit.
+        let body_one = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response_one.into_body(), 1024),
+        )
+        .await
+        .expect("first stream did not finish")
+        .expect("first stream body failed");
+        assert_eq!(&body_one[..], b"x");
+
+        let response_two = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("second request stayed blocked after the first stream finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response_two.status(), StatusCode::OK);
+
+        // Drain the second body so its process/permit is released promptly.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response_two.into_body(), 1024),
+        )
+        .await;
+
+        unsafe {
+            std::env::remove_var("SGIT_MAX_CONCURRENT_REQS");
+            std::env::remove_var("SGIT_STREAM_TIMEOUT");
+        }
+        for repo in [repo_one, repo_two] {
+            let _ = std::fs::remove_dir_all(get_safe_repo_path(repo).unwrap());
+        }
     }
 
     #[tokio::test]

@@ -199,6 +199,7 @@ pub fn load_users_config() -> AppState {
     AppState {
         users: Arc::new(RwLock::new(users)),
         has_users_file: Arc::new(AtomicBool::new(has_users_file)),
+        git_semaphore: None,
     }
 }
 
