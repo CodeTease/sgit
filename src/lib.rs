@@ -253,7 +253,7 @@ mod tests {
         let config_toml = r#"
             [users]
             alice = "f75778f7425be4db0369d09af37a6c2b9a83dea0e53e7bd57412e4b060e607f7" # supersecret
-            bob = "90c1db884b25916cb034e32321487f84b6732cfd1e2e13fa096df0709b1192e2" # pass123
+            bob = "9b8769a4a742959a2d0298c36fb70623f2dfacda8436237df08d8dfd5b37374c" # pass123
         "#;
         fs::write(temp_users_file, config_toml).unwrap();
 
@@ -301,6 +301,39 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        // 3b. Receive-pack (write) with bob's wrong password -> 401 Unauthorized
+        let bad_bob_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("bob:wrongpass"));
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request("GET", "/myrepo/info/refs?service=git-receive-pack")
+                    .header("Authorization", bad_bob_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 3c. Receive-pack (write) with bob's correct password -> 200 OK
+        let good_bob_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("bob:pass123"));
+        let bob_repo_name = "bob_auth_test_repo_123";
+        let bob_safe_path = get_safe_repo_path(bob_repo_name).unwrap();
+        if bob_safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&bob_safe_path);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request("GET", &format!("/{}/info/refs?service=git-receive-pack", bob_repo_name))
+                    .header("Authorization", good_bob_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
         // 4. Receive-pack (write) with correct credentials -> 200 OK (will trigger auto-init on receive-pack or mock folder)
         let good_auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("alice:supersecret"));
         let repo_name = "auth_test_repo_123";
@@ -347,6 +380,7 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&safe_path);
+        let _ = std::fs::remove_dir_all(&bob_safe_path);
         let _ = fs::remove_file(temp_users_file);
         unsafe {
             std::env::remove_var("SGIT_USERS_FILE");
