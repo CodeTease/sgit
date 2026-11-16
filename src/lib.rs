@@ -887,6 +887,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&safe_path);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_aborted_push_lets_receive_pack_finish() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let marker = std::env::temp_dir().join(format!(
+            "sgit-aborted-push-{}.marker",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&marker);
+        // The fake receive-pack only finishes its "transaction" after stdin
+        // closes. Dropping the response body must not SIGKILL it immediately.
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\nsleep 1\necho done > '{}'\n",
+            marker.display()
+        );
+        let _fake_git = install_fake_git_service("git-receive-pack", &script);
+
+        let repo_name = "test_aborted_push_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+
+        let app = app();
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-receive-pack", repo_name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Simulate a client abort / disconnect after the response starts.
+        drop(response);
+
+        let mut completed = false;
+        for _ in 0..40 {
+            if marker.exists() {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            completed,
+            "receive-pack was killed before it could finish its ref transaction"
+        );
+
+        // Give the post-completion maintenance task a moment before cleanup.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
     #[tokio::test]
     async fn test_stream_timeout() {
         let _guard = TEST_LOCK.lock().unwrap();

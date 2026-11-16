@@ -368,11 +368,12 @@ pub async fn execute_git_service_stream(
 
     let response_stream = GitResponseStream {
         inner: ReaderStream::new(child_stdout),
-        child,
+        child: Some(child),
         timeout,
         cancellation_token,
         // Only update HEAD if the service is git-receive-pack (Push)
         repo_path: if is_push { Some(repo_path.clone()) } else { None },
+        completed: false,
     };
     let response_body = Body::from_stream(response_stream);
 
