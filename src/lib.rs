@@ -60,15 +60,18 @@ pub fn app() -> Router {
         .unwrap_or(30);
 
     if rate_limit > 0 {
-        let ms_per_request = 60000 / rate_limit;
-        let governor_conf = std::sync::Arc::new(
-            tower_governor::governor::GovernorConfigBuilder::default()
-                .per_millisecond(ms_per_request as u64)
-                .burst_size(rate_limit)
-                .finish()
-                .unwrap()
-        );
-        app = app.layer(tower_governor::GovernorLayer { config: governor_conf });
+        // Integer division truncates to zero above 60_000 requests/minute, which
+        // makes GovernorConfigBuilder::finish() return None and used to panic.
+        let ms_per_request = std::cmp::max(1, 60000 / rate_limit as u64);
+        if let Some(config) = tower_governor::governor::GovernorConfigBuilder::default()
+            .per_millisecond(ms_per_request)
+            .burst_size(rate_limit)
+            .finish()
+        {
+            app = app.layer(tower_governor::GovernorLayer {
+                config: std::sync::Arc::new(config),
+            });
+        }
     }
 
     app
@@ -521,6 +524,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        unsafe {
+            std::env::remove_var("SGIT_RATE_LIMIT_PER_IP");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_large_rate_limit_does_not_panic() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("SGIT_RATE_LIMIT_PER_IP", "100000");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request("GET", "/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         unsafe {
             std::env::remove_var("SGIT_RATE_LIMIT_PER_IP");
