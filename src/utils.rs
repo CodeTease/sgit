@@ -10,6 +10,11 @@ use axum::{
     extract::{FromRequestParts, Path, Query, State},
 };
 use sha2::{Sha256, Digest};
+use subtle::ConstantTimeEq;
+use argon2::{
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
+    Argon2,
+};
 use crate::types::AppState;
 
 // Security Helper: Validate and map allowed git services
@@ -140,11 +145,40 @@ macro_rules! log_stderr {
     }};
 }
 
-pub fn hash_password(password: &str) -> String {
+/// Legacy unsalted SHA-256 hash (hex). Kept for backwards compatibility with
+/// existing `users.toml` files. New hashes should use [`hash_password`].
+pub fn hash_password_sha256(password: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Hash a password with Argon2id and a fresh random salt.
+///
+/// The returned value is a versioned PHC string (`$argon2id$v=19$...`), so the
+/// algorithm and parameters travel with the hash.
+pub fn hash_password(password: &str) -> String {
+    Argon2::default()
+        .hash_password(password.as_bytes())
+        .expect("Argon2id password hashing failed")
+        .to_string()
+}
+
+/// Verify a password against either an Argon2id PHC hash or a legacy SHA-256
+/// hex digest. Comparisons are constant-time for the stored/computed values.
+pub fn verify_password(stored_hash: &str, password: &str) -> bool {
+    if stored_hash.starts_with("$argon2") {
+        let Ok(parsed) = PasswordHash::new(stored_hash) else {
+            return false;
+        };
+        return Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok();
+    }
+
+    let computed = hash_password_sha256(password);
+    bool::from(stored_hash.as_bytes().ct_eq(computed.as_bytes()))
 }
 
 use std::sync::{Arc, RwLock};
@@ -205,10 +239,9 @@ pub fn check_basic_auth(state: &AppState, auth_header: &str) -> bool {
         return false;
     };
     
-    let hashed_pass = hash_password(pass);
     if let Ok(lock) = state.users.read() {
         if let Some(expected_hash) = lock.get(user) {
-            return expected_hash == &hashed_pass;
+            return verify_password(expected_hash, pass);
         }
     }
     false

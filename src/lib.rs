@@ -557,6 +557,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_argon2_and_legacy_password_verification() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let hash = utils::hash_password("correct horse battery staple");
+        assert!(hash.starts_with("$argon2id$"));
+        assert!(utils::verify_password(&hash, "correct horse battery staple"));
+        assert!(!utils::verify_password(&hash, "wrong password"));
+
+        // A fresh salt must be used for each hash.
+        let second_hash = utils::hash_password("correct horse battery staple");
+        assert_ne!(hash, second_hash);
+        assert!(utils::verify_password(&second_hash, "correct horse battery staple"));
+
+        // Legacy unsalted SHA-256 hashes must keep working.
+        let legacy = "9b8769a4a742959a2d0298c36fb70623f2dfacda8436237df08d8dfd5b37374c"; // pass123
+        assert!(utils::verify_password(legacy, "pass123"));
+        assert!(!utils::verify_password(legacy, "wrong password"));
+        assert!(!utils::verify_password("not-a-valid-hash", "pass123"));
+    }
+
+    #[tokio::test]
     async fn test_env_timeout_and_port() {
         let _guard = TEST_LOCK.lock().unwrap();
         // Test timeout parsing logic from env in a simple way

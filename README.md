@@ -16,7 +16,7 @@ A **CodeTease** project.
 - **Secure by Design**:
   - **Path Traversal Protection**: Multi-layered path sanitization checks block malicious path names containing `..`, leading/trailing slashes, redundant slashes (`//`), backslashes (`\`), or empty names.
   - **HTTP Basic Authentication**: Enforces credential checks on all write/push actions while allowing read actions (such as cloning or fetching) to bypass authentication if desired.
-  - **Secure Password Hashing**: Avoids plaintext storage by validating user passwords against SHA-256 hashes defined in a simple TOML configuration file.
+  - **Secure Password Hashing**: Avoids plaintext storage by validating user passwords against salted Argon2id hashes (legacy SHA-256 hashes are also supported) defined in a simple TOML configuration file.
 - **Self-Healing and Automatic Maintenance**:
   - **HEAD Resolution**: Automatically updates the repository's `HEAD` to point to a valid active branch (e.g., `main` or `master`) if it becomes unborn or invalid after a push.
   - **Asynchronous Garbage Collection**: Spawns non-blocking background tasks to execute `git gc --auto` upon successful pushes, keeping disk usage and packfiles optimized.
@@ -53,7 +53,10 @@ To enable HTTP Basic Authentication for write operations, create a `users.toml` 
 If the configuration file is **absent**, SGit operates in public-write mode (authentication checks are bypassed entirely).
 
 ### Format of `users.toml`
-User passwords must be stored as **SHA-256 hexadecimal hashes** to protect credentials at rest.
+Passwords can be stored as salted **Argon2id PHC hashes** (recommended) or as
+legacy unsalted **SHA-256 hexadecimal hashes**. Argon2id hashes are verified in
+constant time and include their algorithm parameters and a unique salt, so they
+should be preferred for new deployments.
 
 ```toml
 [users]
@@ -64,9 +67,15 @@ alice = "f75778f7425be4db0369d09af37a6c2b9a83dea0e53e7bd57412e4b060e607f7"
 bob = "9b8769a4a742959a2d0298c36fb70623f2dfacda8436237df08d8dfd5b37374c"
 ```
 
-To generate a SHA-256 hash for a password, you can run:
+To generate a legacy SHA-256 hash for a password, you can run:
 ```bash
 echo -n "your_password" | sha256sum
+```
+
+To generate a salted Argon2id hash, use the `argon2` CLI (or any Argon2
+library) and store the complete PHC string it prints:
+```bash
+echo -n "your_password" | argon2 "$(openssl rand -base64 12)" -id -e
 ```
 
 ---
