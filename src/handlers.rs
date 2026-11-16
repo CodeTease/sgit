@@ -24,18 +24,20 @@ pub async fn handle_git_request(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if path.ends_with("/info/refs") && method == Method::GET {
-        let repo = path.trim_end_matches("/info/refs").to_string();
-        handle_info_refs_internal(repo, params, headers).await
-    } else if path.ends_with("/git-upload-pack") && method == Method::POST {
-        let repo = path.trim_end_matches("/git-upload-pack").to_string();
-        execute_git_service_stream(repo, "git-upload-pack", headers, body).await
-    } else if path.ends_with("/git-receive-pack") && method == Method::POST {
-        let repo = path.trim_end_matches("/git-receive-pack").to_string();
-        execute_git_service_stream(repo, "git-receive-pack", headers, body).await
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    if method == Method::GET {
+        if let Some(repo) = path.strip_suffix("/info/refs") {
+            return handle_info_refs_internal(repo.to_string(), params, headers).await;
+        }
+    } else if method == Method::POST {
+        if let Some(repo) = path.strip_suffix("/git-upload-pack") {
+            return execute_git_service_stream(repo.to_string(), "git-upload-pack", headers, body).await;
+        }
+        if let Some(repo) = path.strip_suffix("/git-receive-pack") {
+            return execute_git_service_stream(repo.to_string(), "git-receive-pack", headers, body).await;
+        }
     }
+
+    StatusCode::NOT_FOUND.into_response()
 }
 
 // 1. Discover refs handler

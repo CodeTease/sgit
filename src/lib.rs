@@ -149,6 +149,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_duplicate_endpoint_suffixes_are_rejected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo_name = "test_dupe_suffix_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        let app = app();
+
+        // Duplicated info/refs suffix must not be silently routed to the repository prefix.
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request(
+                    "GET",
+                    &format!("/{}/info/refs/info/refs?service=git-upload-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Duplicated RPC suffix must not be silently routed to the repository prefix.
+        let response = app
+            .clone()
+            .oneshot(
+                mock_request(
+                    "POST",
+                    &format!("/{}/git-upload-pack/git-upload-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The canonical endpoint must still work.
+        let response = app
+            .oneshot(
+                mock_request(
+                    "GET",
+                    &format!("/{}/info/refs?service=git-upload-pack", repo_name),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[tokio::test]
     async fn test_pkt_line_encode_and_ref_advertisement() {
         let _guard = TEST_LOCK.lock().unwrap();
         let repo_name = "test_ref_advertisement_repo";
