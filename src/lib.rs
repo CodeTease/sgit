@@ -945,7 +945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_timeout() {
+    async fn test_stream_timeout_zero_disables_timeout() {
         let _guard = TEST_LOCK.lock().unwrap();
         let repo_name = "test_stream_timeout_repo";
         let safe_path = get_safe_repo_path(repo_name).unwrap();
@@ -969,9 +969,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body();
-        let result = axum::body::to_bytes(body, 1000000).await;
-        assert!(result.is_err());
+        let result = axum::body::to_bytes(response.into_body(), 1000000).await;
+        assert!(result.is_ok(), "a zero stream timeout should disable the limit");
+
+        unsafe {
+            std::env::remove_var("SGIT_STREAM_TIMEOUT");
+        }
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stream_idle_timeout_kills_stalled_git() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        let pid_file = std::env::temp_dir().join(format!(
+            "sgit-stream-timeout-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        );
+        let _fake_git = install_fake_git_service("git-upload-pack", &script);
+
+        let repo_name = "test_stream_idle_timeout_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        unsafe {
+            std::env::set_var("SGIT_STREAM_TIMEOUT", "1");
+            std::env::remove_var("SGIT_TIMEOUT");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Reading the body continuously must still observe the timeout: the
+        // fake git process never produces output.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), 1000000),
+        )
+        .await
+        .expect("stream body did not finish after the idle timeout");
+        assert!(result.is_err(), "stalled stream should return a timeout error");
+
+        unsafe {
+            std::env::remove_var("SGIT_STREAM_TIMEOUT");
+        }
+
+        let pid = fs::read_to_string(&pid_file)
+            .expect("fake git service did not record its pid")
+            .trim()
+            .to_string();
+        let mut reaped = false;
+        for _ in 0..40 {
+            if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(reaped, "stalled git child {} was not killed", pid);
+
+        let _ = fs::remove_file(&pid_file);
+        let _ = std::fs::remove_dir_all(&safe_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stream_timeout_resets_on_progress() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        // Emit a byte every 250 ms for ~2 s with a 1 s idle timeout. A total
+        // deadline would cut this transfer off; an idle timeout must not.
+        let script = "#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8; do printf x; sleep 0.25; done\n";
+        let _fake_git = install_fake_git_service("git-upload-pack", script);
+
+        let repo_name = "test_stream_progress_repo";
+        let safe_path = get_safe_repo_path(repo_name).unwrap();
+        if safe_path.exists() {
+            let _ = std::fs::remove_dir_all(&safe_path);
+        }
+        let _repo = git2::Repository::init_bare(&safe_path).unwrap();
+
+        unsafe {
+            std::env::set_var("SGIT_STREAM_TIMEOUT", "1");
+            std::env::remove_var("SGIT_TIMEOUT");
+        }
+        let app = app();
+
+        let response = app
+            .oneshot(
+                mock_request("POST", &format!("/{}/git-upload-pack", repo_name))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), 1000000),
+        )
+        .await
+        .expect("active stream did not finish")
+        .expect("active stream was cut off by the timeout");
+        assert_eq!(&body[..], b"xxxxxxxx");
 
         unsafe {
             std::env::remove_var("SGIT_STREAM_TIMEOUT");

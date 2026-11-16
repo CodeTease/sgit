@@ -41,7 +41,7 @@ SGit is highly configurable using process-wide environment variables:
 | `SGIT_MAX_CONCURRENT_REQS` | Maximum number of concurrent git processes to prevent CPU/RAM usage spikes (`0` disables the limit) | `20` |
 | `SGIT_RATE_LIMIT_PER_IP` | Maximum number of requests per IP address per minute to mitigate spam/DoS | `30` |
 | `SGIT_READ_TIMEOUT`  | Execution timeout in seconds for small metadata read requests like `info/refs` | `15` |
-| `SGIT_STREAM_TIMEOUT` | Execution timeout in seconds for data streaming during push/pull operations (falls back to `SGIT_TIMEOUT`) | `60` |
+| `SGIT_STREAM_TIMEOUT` | Idle timeout in seconds for data streaming during push/pull operations; resets whenever data moves and `0` disables it (falls back to `SGIT_TIMEOUT`) | `60` |
 | `SGIT_MAX_REPO_SIZE_MB` | Maximum allowed repository storage size in MB (enforces disk quota per repository) | `None` (unlimited) |
 
 ---

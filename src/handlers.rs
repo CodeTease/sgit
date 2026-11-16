@@ -5,10 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::{collections::HashMap, process::Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use tokio::sync::Notify;
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use crate::types::GitResponseStream;
+use crate::types::{spawn_idle_timeout, GitResponseStream};
 use crate::utils::{validate_service, get_safe_repo_path, ensure_repo_exists, pkt_line_encode, update_head_if_invalid};
 
 // REST API: GET / (health check)
@@ -320,6 +323,9 @@ pub async fn execute_git_service_stream(
     let mut child_stderr = child.stderr.take().unwrap();
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let child = Arc::new(Mutex::new(Some(child)));
+    let activity = Arc::new(Notify::new());
+    let timed_out = Arc::new(AtomicBool::new(false));
 
     // Spawn background task to read stderr and log it
     let stderr_token = cancellation_token.clone();
@@ -337,10 +343,13 @@ pub async fn execute_git_service_stream(
         }
     });
 
-    // Stream Axum Body directly into process stdin in background task
+    // Stream Axum Body directly into process stdin in background task. Each
+    // written chunk counts as progress for the idle timeout, so a long upload
+    // is not mistaken for a stalled stream.
     let stdin_token = cancellation_token.clone();
+    let stdin_activity = activity.clone();
     tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let body_stream = body.into_data_stream();
         let body_reader = StreamReader::new(
             tokio_stream::StreamExt::map(body_stream, |res| {
@@ -348,13 +357,29 @@ pub async fn execute_git_service_stream(
             })
         );
         let mut limited_reader = body_reader.take(limit_bytes);
+        let mut buf = vec![0u8; 64 * 1024];
+
         tokio::select! {
-            _ = stdin_token.cancelled() => {},
-            _ = tokio::io::copy(&mut limited_reader, &mut child_stdin) => {}
+            _ = stdin_token.cancelled() => {}
+            _ = async {
+                loop {
+                    match limited_reader.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if child_stdin.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                            stdin_activity.notify_one();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            } => {}
         }
     });
 
-    // Wrap stdout in GitResponseStream with timeout read from environment variable SGIT_STREAM_TIMEOUT, falling back to SGIT_TIMEOUT (default 60s)
+    // Timeout read from SGIT_STREAM_TIMEOUT, falling back to SGIT_TIMEOUT
+    // (default 60s). A value of 0 disables the timeout.
     let timeout_secs = std::env::var("SGIT_STREAM_TIMEOUT")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
@@ -364,12 +389,22 @@ pub async fn execute_git_service_stream(
                 .and_then(|val| val.parse::<u64>().ok())
         })
         .unwrap_or(60);
-    let timeout = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)));
+
+    if timeout_secs > 0 {
+        spawn_idle_timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.clone(),
+            activity.clone(),
+            timed_out.clone(),
+            cancellation_token.clone(),
+        );
+    }
 
     let response_stream = GitResponseStream {
         inner: ReaderStream::new(child_stdout),
-        child: Some(child),
-        timeout,
+        child,
+        activity,
+        timed_out,
         cancellation_token,
         // Only update HEAD if the service is git-receive-pack (Push)
         repo_path: if is_push { Some(repo_path.clone()) } else { None },

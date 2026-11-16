@@ -3,14 +3,15 @@ use std::task::{Context, Poll};
 use std::path::PathBuf;
 use futures_core::Stream;
 use bytes::Bytes;
-use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use crate::utils::update_head_if_invalid;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::time::Duration;
 
-use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -18,17 +19,26 @@ pub struct AppState {
     pub has_users_file: Arc<AtomicBool>,
 }
 
+type SharedChild = Arc<Mutex<Option<tokio::process::Child>>>;
+
 // Custom response stream that owns the git process and its stdout.
 //
-// The child is kept in an Option so Drop can move it into an asynchronous
-// waiter. On a client disconnect the stdin writer is cancelled (closing git's
-// stdin), which lets receive-pack finish its ref transaction instead of being
-// killed mid-update. A grace period prevents a truly stuck process from
-// lingering forever.
+// The child is shared with an independent idle-timeout task. This matters
+// because hyper polls a response body only when the client socket can accept
+// more data: a slow/non-reading client must not prevent the timeout from
+// firing (and the git process from being killed).
+//
+// On a client disconnect the stdin writer is cancelled (closing git's stdin),
+// which lets receive-pack finish its ref transaction instead of being killed
+// mid-update. A grace period prevents a truly stuck process from lingering
+// forever.
 pub struct GitResponseStream {
     pub inner: ReaderStream<tokio::process::ChildStdout>,
-    pub child: Option<tokio::process::Child>,
-    pub timeout: Pin<Box<Sleep>>,
+    pub child: SharedChild,
+    /// Notified whenever stdout makes progress (resets the idle timeout).
+    pub activity: Arc<Notify>,
+    /// Set by the idle-timeout task right before it kills the child.
+    pub timed_out: Arc<AtomicBool>,
     pub cancellation_token: tokio_util::sync::CancellationToken,
     pub repo_path: Option<PathBuf>,
     /// True once stdout reached EOF, i.e. the body completed normally.
@@ -38,14 +48,9 @@ pub struct GitResponseStream {
 impl Stream for GitResponseStream {
     type Item = Result<Bytes, std::io::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        use std::future::Future;
-        // Check timeout
-        if self.timeout.as_mut().poll(cx).is_ready() {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.timed_out.load(Ordering::SeqCst) {
             self.cancellation_token.cancel();
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.start_kill();
-            }
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Git process timed out",
@@ -55,8 +60,10 @@ impl Stream for GitResponseStream {
         // Poll stdout
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_next(cx);
-        if matches!(result, Poll::Ready(None)) {
-            this.completed = true;
+        match &result {
+            Poll::Ready(Some(Ok(_))) => this.activity.notify_one(),
+            Poll::Ready(None) => this.completed = true,
+            _ => {}
         }
         result
     }
@@ -66,22 +73,20 @@ impl Drop for GitResponseStream {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
 
-        let Some(mut child) = self.child.take() else {
+        let child = match self.child.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(mut child) = child else {
             return;
         };
         let repo_path = self.repo_path.clone();
-        let completed_normally = self.completed;
 
         // Drop is synchronous, so move the child into a task that can wait for
         // it. Never SIGKILL immediately: receive-pack may be committing refs or
         // running hooks.
         tokio::spawn(async move {
-            let status = match tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                child.wait(),
-            )
-            .await
-            {
+            let status = match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
                 Ok(Ok(status)) => Some(status),
                 Ok(Err(_)) => None,
                 Err(_) => {
@@ -115,12 +120,44 @@ impl Drop for GitResponseStream {
                     });
                 }
             }
-
-            // Kept for clarity: a normal EOF is the common path. Aborted
-            // uploads also reach here after stdin closes; both are awaited
-            // before any fallback kill.
-            let _ = completed_normally;
         });
     }
+}
+
+/// Enforce an idle timeout independently of response-body polling.
+///
+/// The timer only resets when either stdout makes progress or stdin receives
+/// request data; a client that stops reading (or a git process that stops
+/// producing output) is killed once the idle period elapses.
+pub fn spawn_idle_timeout(
+    idle_timeout: Duration,
+    child: SharedChild,
+    activity: Arc<Notify>,
+    timed_out: Arc<AtomicBool>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // The body was consumed or dropped; the Drop waiter handles
+                // the child from here.
+                _ = cancellation_token.cancelled() => return,
+                // Progress reset the idle deadline.
+                _ = activity.notified() => continue,
+                _ = tokio::time::sleep(idle_timeout) => {
+                    timed_out.store(true, Ordering::SeqCst);
+                    cancellation_token.cancel();
+                    let mut slot = match child.lock() {
+                        Ok(slot) => slot,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some(child) = slot.as_mut() {
+                        let _ = child.start_kill();
+                    }
+                    return;
+                }
+            }
+        }
+    });
 }
 
