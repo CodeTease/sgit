@@ -175,12 +175,19 @@ pub fn spawn_idle_timeout(
                 _ = tokio::time::sleep(idle_timeout) => {
                     timed_out.store(true, Ordering::SeqCst);
                     cancellation_token.cancel();
-                    let mut slot = match child.lock() {
-                        Ok(slot) => slot,
-                        Err(poisoned) => poisoned.into_inner(),
+                    let child = {
+                        let mut slot = match child.lock() {
+                            Ok(slot) => slot,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        slot.take()
                     };
-                    if let Some(child) = slot.as_mut() {
+                    // Kill and reap here instead of leaving a zombie for the
+                    // eventual body drop (which may be delayed by a slow or
+                    // non-reading client).
+                    if let Some(mut child) = child {
                         let _ = child.start_kill();
+                        let _ = child.wait().await;
                     }
                     return;
                 }
